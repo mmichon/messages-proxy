@@ -196,7 +196,10 @@ Nothing here may grow without bound:
   `?t=<token>`, and the startup line prints the placeholder. The log is mode 600.
 - The `$TMPDIR/messages-proxy-snap/` copy of chat.db (only made while chat.db is
   locked) is deleted by `_drop_snapshot()` once the live DB is readable again.
-- `state.db` is one row per chat; attachments are streamed, never copied.
+- `cache/` holds transcoded image previews; `_prune_cache()` drops the
+  least-recently-used files past 300 MB (`CACHE_MAX_BYTES`) on every write.
+- `state.db` is one row per chat; original attachments are read straight from
+  Apple's folder, never copied.
 
 ## Permissions — why cron and not launchd
 
