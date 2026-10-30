@@ -801,8 +801,19 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "messages-proxy"
     protocol_version = "HTTP/1.1"
 
+    # Every open tab polls every few seconds; logging those successes was most of
+    # the log's growth. Failures on these paths are still logged.
+    QUIET_PATHS = ("/api/poll", "/api/match")
+
+    def log_request(self, code="-", size="-"):
+        if isinstance(code, int) and code < 400 and self.path.startswith(self.QUIET_PATHS):
+            return
+        BaseHTTPRequestHandler.log_request(self, code, size)
+
     def log_message(self, fmt, *args):
-        sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
+        # The default format includes the request line, which carries ?t=<token>.
+        msg = re.sub(r"([?&]t=)[^&\s\"]+", r"\1<token>", fmt % args)
+        sys.stderr.write("%s %s\n" % (self.address_string(), msg))
 
     # -- helpers
 
@@ -1459,7 +1470,7 @@ def main():
     srv.daemon_threads = True
     sys.stderr.write(
         "messages-proxy on http://%s:%d/%s\n"
-        % (BIND, PORT, ("?t=" + TOKEN) if TOKEN else "")
+        % (BIND, PORT, "?t=<token>" if TOKEN else "")
     )
     try:
         srv.serve_forever()

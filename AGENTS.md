@@ -158,6 +158,21 @@ Notes:
 - Funnel required a one-time enable on the tailnet in the admin console.
 - First visit needs `?t=<token>`; after that an HttpOnly cookie carries it.
 
+## Disk use
+
+Nothing here may grow without bound:
+
+- `messages-proxy.log` is capped by `keepalive.sh` (every minute from cron) at 5 MB
+  plus one `messages-proxy.log.1`, copy-then-truncate so the running server's
+  O_APPEND fd keeps working. Successful `/api/poll` and `/api/match` requests
+  aren't logged at all — every open tab polls every few seconds and those lines
+  were most of the growth.
+- The token is never written to the log: `log_message()` rewrites `?t=…` to
+  `?t=<token>`, and the startup line prints the placeholder. The log is mode 600.
+- The `$TMPDIR/messages-proxy-snap/` copy of chat.db (only made while chat.db is
+  locked) is deleted by `_drop_snapshot()` once the live DB is readable again.
+- `state.db` is one row per chat; attachments are streamed, never copied.
+
 ## Permissions — why cron and not launchd
 
 The process needs two TCC grants: **Full Disk Access** (read chat.db) and
