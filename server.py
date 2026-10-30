@@ -296,47 +296,48 @@ def nickname_map():
     return out
 
 
-def contact_map():
-    """handle (phone key or lowercased email) -> display name, from all Contacts sources."""
+def _addressbook_rows():
+    """(raw phone-or-email, label) for every named entry in every Contacts source."""
     import glob
 
+    for path in glob.glob(ADDRESSBOOK_GLOB):
+        try:
+            con = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=3)
+        except sqlite3.Error:
+            continue
+        try:
+            for table, col in (
+                ("ZABCDPHONENUMBER", "ZFULLNUMBER"),
+                ("ZABCDEMAILADDRESS", "ZADDRESS"),
+            ):
+                try:
+                    rows = con.execute(
+                        "select x.%s, r.ZFIRSTNAME, r.ZLASTNAME, r.ZORGANIZATION, "
+                        "r.ZNICKNAME from %s x join ZABCDRECORD r on r.Z_PK = x.ZOWNER"
+                        % (col, table)
+                    ).fetchall()
+                except sqlite3.Error:
+                    continue
+                for value, first, last, org, nick in rows:
+                    label = _contact_label(first, last, org, nick)
+                    if value and label:
+                        yield value, label
+        finally:
+            con.close()
+
+
+def contact_map():
+    """handle (phone key or lowercased email) -> display name, from all Contacts sources."""
     with _contacts_lock:
         now = time.time()
         if _contacts["map"] is not None and now - _contacts["at"] < CONTACTS_TTL:
             return _contacts["map"]
 
         out = {}
-        for path in glob.glob(ADDRESSBOOK_GLOB):
-            try:
-                con = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=3)
-            except sqlite3.Error:
-                continue
-            try:
-                for table, col in (
-                    ("ZABCDPHONENUMBER", "ZFULLNUMBER"),
-                    ("ZABCDEMAILADDRESS", "ZADDRESS"),
-                ):
-                    try:
-                        rows = con.execute(
-                            "select x.%s, r.ZFIRSTNAME, r.ZLASTNAME, r.ZORGANIZATION, "
-                            "r.ZNICKNAME from %s x join ZABCDRECORD r on r.Z_PK = x.ZOWNER"
-                            % (col, table)
-                        ).fetchall()
-                    except sqlite3.Error:
-                        continue
-                    for value, first, last, org, nick in rows:
-                        label = _contact_label(first, last, org, nick)
-                        if not value or not label:
-                            continue
-                        key = (
-                            _phone_key(value)
-                            if table == "ZABCDPHONENUMBER"
-                            else value.strip().lower()
-                        )
-                        if key:
-                            out.setdefault(key, label)
-            finally:
-                con.close()
+        for value, label in _addressbook_rows():
+            key = handle_key(value)
+            if key:
+                out.setdefault(key, label)
 
         # Shared names fill handles Contacts has nothing for; setdefault keeps
         # the user's own Contacts entry authoritative when both have a name.
@@ -354,6 +355,109 @@ def pretty_handle(handle):
         return ""
     names = contact_map()
     return names.get(handle_key(handle), handle)
+
+
+# ------------------------------------------------------- recipient autocomplete
+
+_directory_lock = threading.Lock()
+_directory = {"list": None, "at": 0.0}
+
+
+def _sendable(value):
+    """A Contacts phone/email in a form Messages accepts as a participant."""
+    value = value.strip()
+    if "@" in value:
+        return value.lower()
+    digits = re.sub(r"\D", "", value)
+    if value.startswith("+"):
+        return "+" + digits
+    if len(digits) == 10:
+        return "+1" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    return digits
+
+
+def contact_directory():
+    """Everyone you could address: [{name, handle, recent}], one per handle_key.
+
+    chat.db handles come first — their ids are forms Messages has already sent
+    to, and `recent` (newest message rowid) ranks the people you actually talk
+    to above the rest of Contacts. Contacts entries you've never messaged follow
+    with recent=0. Own lock: this calls contact_map(), which takes _contacts_lock.
+    """
+    with _directory_lock:
+        now = time.time()
+        if _directory["list"] is not None and now - _directory["at"] < CONTACTS_TTL:
+            return _directory["list"]
+
+        names = contact_map()
+        con = chat_db()
+        try:
+            rows = con.execute(
+                "select h.id, max(m.ROWID) from handle h "
+                "left join message m on m.handle_id = h.ROWID group by h.id"
+            ).fetchall()
+        finally:
+            con.close()
+
+        by_key = {}
+        for handle, recent in rows:
+            key = handle_key(handle)
+            if not key:
+                continue
+            prev = by_key.get(key)
+            # Same person under iMessage and SMS rows: keep the more recent one.
+            if prev is None or (recent or 0) > prev["recent"]:
+                by_key[key] = {
+                    "name": names.get(key, ""),
+                    "handle": handle,
+                    "recent": recent or 0,
+                }
+        for value, label in _addressbook_rows():
+            key = handle_key(value)
+            if key and key not in by_key:
+                by_key[key] = {"name": label, "handle": _sendable(value), "recent": 0}
+
+        _directory["list"] = list(by_key.values())
+        _directory["at"] = now
+        return _directory["list"]
+
+
+def search_contacts(query, limit=8):
+    """Best directory matches for a partial name, number, or email."""
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    digits = re.sub(r"\D", "", q)
+    numeric = digits and not re.sub(r"[\d\s()+.-]", "", q)
+
+    scored = []
+    for e in contact_directory():
+        name = e["name"].lower()
+        if numeric:
+            if len(digits) < 3 or digits not in re.sub(r"\D", "", e["handle"]):
+                continue
+            rank = 0
+        elif name.startswith(q):
+            rank = 0
+        elif any(w.startswith(q) for w in name.split()):
+            rank = 1
+        elif q in name:
+            rank = 2
+        elif "@" in e["handle"] and e["handle"].startswith(q):
+            rank = 3
+        else:
+            continue
+        # Among prefix matches, people you've actually messaged come first: "kan"
+        # finds the Kanter you text before Kangaroo Babysitting. Mid-word hits stay
+        # below every prefix match, or "ann" would put Joanna above Ann.
+        scored.append((rank >= 2, e["recent"] == 0, rank, -e["recent"], name, e))
+    scored.sort(key=lambda t: t[:5])
+    return [
+        {"name": e["name"] or e["handle"], "handle": e["handle"]}
+        for *_, e in scored[:limit]
+    ]
 
 
 def apple_ts(value):
@@ -840,15 +944,27 @@ def find_chat_for_handle(handle):
     return None
 
 
-def parse_handles(value):
-    """Accept a list or a comma-separated string; trim, drop blanks, de-dupe."""
+def parse_handles(value, rejects=None):
+    """Accept a list or a comma-separated string; trim, drop blanks, de-dupe.
+
+    Entries that aren't a phone number or email (a bare name typed without
+    picking a suggestion) go into `rejects` when given — a caller that sends
+    must refuse them, or "Matt, +1415…" would quietly become a 1:1.
+    """
     if isinstance(value, str):
         value = value.split(",")
     out, seen = [], set()
     for item in value or []:
         item = (item or "").strip()
+        if not item:
+            continue
         key = handle_key(item)
-        if not item or not key or key in seen:
+        # Letters outside an email mean a name, even if it has a digit in it.
+        if not key or ("@" not in item and re.search(r"[A-Za-z]", item)):
+            if rejects is not None:
+                rejects.append(item)
+            continue
+        if key in seen:
             continue
         seen.add(key)
         out.append(item)
@@ -1145,6 +1261,9 @@ class Handler(BaseHTTPRequestHandler):
                 if msgs is None:
                     return self._send(404, {"error": "no such chat"})
                 return self._send(200, {"messages": msgs}, extra=cookie)
+            if url.path == "/api/contacts":
+                term = (q.get("q") or [""])[0]
+                return self._send(200, {"contacts": search_contacts(term)}, extra=cookie)
             if url.path == "/api/match":
                 handles = parse_handles((q.get("handles") or [""])[0])
                 guid = (
@@ -1206,9 +1325,15 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, {"ok": True, "via": info}, extra=cookie)
                 return self._send(502, {"ok": False, "error": info})
             if url.path == "/api/new":
+                rejects = []
                 handles = parse_handles(
-                    body.get("handles") or body.get("handle") or ""
+                    body.get("handles") or body.get("handle") or "", rejects
                 )
+                if rejects:
+                    return self._send(400, {"error": (
+                        "Not a phone number or email: %s — pick the person from "
+                        "the suggestions instead." % ", ".join(rejects)
+                    )})
                 text = body.get("text") or ""
                 if not handles or not text.strip():
                     return self._send(400, {"error": "handle and text required"})
@@ -1466,6 +1591,20 @@ PAGE = r"""<!doctype html>
     border-radius: 8px; background: var(--bg); color: var(--fg); font: inherit;
     display: none;
   }
+  #suggest {
+    margin: -6px 12px 10px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--bg); overflow: hidden; display: none;
+  }
+  #suggest div {
+    padding: 8px 10px; cursor: pointer; display: flex; flex-direction: column;
+    border-top: 1px solid var(--line);
+  }
+  #suggest div:first-child { border-top: none; }
+  #suggest div.on, #suggest div:hover { background: var(--line); }
+  #suggest small {
+    color: var(--dim); font-size: 11px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   #head button.ghost {
     border: 1px solid var(--line); background: none; color: var(--dim);
     border-radius: 7px; padding: 4px 9px; font: inherit; font-size: 12px;
@@ -1549,7 +1688,8 @@ PAGE = r"""<!doctype html>
 </head><body>
 <aside id="side">
   <h1><span>Messages<button id="net" style="display:none"></button></span><button id="new">+ New</button></h1>
-  <input id="to" placeholder="Phone numbers or emails, comma-separated" autocomplete="off">
+  <input id="to" placeholder="Name, number, or email" autocomplete="off">
+  <div id="suggest"></div>
   <input id="search" placeholder="Filter conversations" autocomplete="off">
   <div id="chats"></div>
 </aside>
@@ -1780,6 +1920,7 @@ function closeThread() {
   lastTs = 0;
   composing = false;
   $("#to").style.display = "none";
+  hideSuggest();
   $("#title").textContent = "Pick a conversation";
   $("#sub").textContent = "";
   $("#markunread").style.display = "none";
@@ -1805,7 +1946,7 @@ function startCompose() {
   $("#thread").textContent = "";
   const e = document.createElement("div");
   e.className = "empty";
-  e.textContent = "Enter one or more recipients above, comma-separated";
+  e.textContent = "Type a name above — add more people for a group";
   $("#thread").append(e);
   $("#text").disabled = false;
   $("#send").disabled = false;
@@ -1820,6 +1961,7 @@ async function open(c) {
   lastId = 0;
   lastTs = 0;
   $("#to").style.display = "none";
+  hideSuggest();
   $("#markunread").style.display = "";
   $("#title").textContent = c.name;
   const who = (c.names && c.names.length ? c.names : c.handles).join(", ");
@@ -2005,6 +2147,12 @@ async function send() {
   if (!text.trim()) return;
   const handles = composing ? splitHandles($("#to").value) : [];
   if (composing && !handles.length) { $("#to").focus(); return; }
+  const unpicked = handles.filter(t => !isHandle(t));
+  if (unpicked.length) {
+    $("#err").textContent = "Pick " + unpicked.join(", ") + " from the suggestions first.";
+    $("#to").focus();
+    return;
+  }
   if (!composing && !cur) return;
   $("#send").disabled = true;
   $("#err").textContent = "";
@@ -2043,25 +2191,104 @@ async function send() {
 $("#send").onclick = send;
 $("#new").onclick = startCompose;
 $("#markunread").onclick = () => { if (cur) markUnread(cur.guid); };
-$("#to").addEventListener("keydown", e => {
-  if (e.key === "Enter") { e.preventDefault(); $("#text").focus(); }
-});
-// Resolve recipients while they're typed: a group that doesn't exist can't be
-// created from here, so say so before a message gets written.
+// -- recipient autocomplete. The field holds comma-separated handles; whatever
+// follows the last comma is the term being typed, and picking a suggestion
+// swaps that term for the person's handle.
+let suggestions = [], suggestOn = -1, suggestTimer = null, suggestFor = "";
+
+function isHandle(t) {
+  return t.includes("@") || (/^[\d\s()+.-]+$/.test(t) && t.replace(/\D/g, "").length >= 5);
+}
+
+function currentTerm() {
+  const v = $("#to").value;
+  return v.slice(v.lastIndexOf(",") + 1).trim();
+}
+
+function hideSuggest() {
+  suggestions = []; suggestOn = -1;
+  $("#suggest").style.display = "none";
+}
+
+function drawSuggest() {
+  const box = $("#suggest");
+  box.textContent = "";
+  if (!suggestions.length) { box.style.display = "none"; return; }
+  suggestions.forEach((c, i) => {
+    const row = document.createElement("div");
+    if (i === suggestOn) row.className = "on";
+    const name = document.createElement("span");
+    name.textContent = c.name;
+    const handle = document.createElement("small");
+    handle.textContent = c.handle;
+    row.append(name, handle);
+    // pointerdown, not click: click fires after the input's blur has hidden us.
+    row.addEventListener("pointerdown", ev => { ev.preventDefault(); pickSuggest(i); });
+    box.append(row);
+  });
+  box.style.display = "block";
+}
+
+function pickSuggest(i) {
+  const c = suggestions[i];
+  if (!c) return;
+  const v = $("#to").value;
+  $("#to").value = v.slice(0, v.lastIndexOf(",") + 1).replace(/,$/, ", ").trimStart() + c.handle + ", ";
+  hideSuggest();
+  $("#to").focus();
+  resolveRecipients();
+}
+
+// Say who the message will reach, and whether that thread exists: a group that
+// doesn't exist can't be created from here, so say so before anything's written.
 let matchTimer = null;
-$("#to").addEventListener("input", () => {
+function resolveRecipients() {
   clearTimeout(matchTimer);
-  const handles = splitHandles($("#to").value);
-  if (handles.length < 2) { $("#sub").textContent = ""; return; }
+  const handles = splitHandles($("#to").value).filter(isHandle);
+  if (!handles.length) { $("#sub").textContent = ""; return; }
   matchTimer = setTimeout(async () => {
     try {
       const r = await api("/api/match?handles=" + encodeURIComponent(handles.join(",")));
-      $("#sub").textContent = r.found
-        ? "→ " + r.names.join(", ")
+      const who = r.names.join(", ");
+      $("#sub").textContent = r.found ? "→ " + who
+        : handles.length === 1 ? "new conversation with " + who
         : "no existing group with these " + handles.length + " people";
     } catch (e) { $("#sub").textContent = ""; }
   }, 250);
+}
+
+$("#to").addEventListener("input", () => {
+  resolveRecipients();
+  clearTimeout(suggestTimer);
+  const term = currentTerm();
+  if (!term || isHandle(term)) { hideSuggest(); return; }
+  suggestTimer = setTimeout(async () => {
+    suggestFor = term;
+    try {
+      const r = await api("/api/contacts?q=" + encodeURIComponent(term));
+      if (suggestFor !== currentTerm()) return;   // typed on meanwhile
+      suggestions = r.contacts; suggestOn = suggestions.length ? 0 : -1;
+      drawSuggest();
+    } catch (e) { hideSuggest(); }
+  }, 120);
 });
+$("#to").addEventListener("keydown", e => {
+  if (suggestions.length) {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const n = suggestions.length;
+      suggestOn = (suggestOn + (e.key === "ArrowDown" ? 1 : n - 1)) % n;
+      return drawSuggest();
+    }
+    if (e.key === "Enter" || e.key === "Tab") {
+      e.preventDefault();
+      return pickSuggest(Math.max(suggestOn, 0));
+    }
+    if (e.key === "Escape") return hideSuggest();
+  }
+  if (e.key === "Enter") { e.preventDefault(); $("#text").focus(); }
+});
+$("#to").addEventListener("blur", () => setTimeout(hideSuggest, 150));
 $("#text").addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });

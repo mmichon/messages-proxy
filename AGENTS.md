@@ -188,6 +188,27 @@ keep it that way so 1:1 and group matching can't drift. Group GUIDs are
 the tail starts with `chat` — those variants are meaningless for a group and only
 bury the real error.
 
+**Recipient autocomplete** (`GET /api/contacts?q=`). `contact_map()` only keeps
+normalized key → name, which can't be sent to, so `contact_directory()` builds
+`{name, handle, recent}` per `handle_key`: chat.db `handle.id` values first (forms
+Messages has already sent to; `recent` = newest message rowid), then Contacts
+entries never messaged, normalized by `_sendable()` (`+1` for bare 10-digit US
+numbers). Same 10-minute TTL as `contact_map`, with its **own lock** — it calls
+`contact_map()`, so sharing `_contacts_lock` would deadlock. ~80 ms to build 7k
+entries, ~3 ms per search.
+
+Ranking in `search_contacts()`: prefix and word-prefix matches first, and among
+those, people you've actually messaged before the rest of Contacts ("kan" → the
+Kanter you text, not Kangaroo Babysitting); mid-word substring hits always below
+every prefix hit (else "ann" puts Joanna above Ann).
+
+The field still holds comma-separated handles — picking a suggestion swaps the
+term after the last comma for the person's handle, and the `#sub` line shows the
+resolved names. A typed name that was never picked is refused twice: the client
+won't send it, and `parse_handles(…, rejects)` makes `/api/new` 400 on it.
+Before that, `parse_handles` silently dropped non-handles, so "Matt, +1415…"
+would have quietly gone out as a 1:1 to the other person.
+
 **Mark unread** (`POST /api/unread`) rewinds this app's `seen` marker to one below
 the chat's last incoming rowid. It is **web-UI only** — chat.db is never written, so
 Messages.app on this Mac and your iPhone keep their own read state and will not show
