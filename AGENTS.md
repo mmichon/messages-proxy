@@ -1,4 +1,4 @@
-# imsg-web
+# messages-proxy
 
 Reads iMessage/SMS history from `~/Library/Messages/chat.db` and sends through
 Messages.app, exposing both over a LAN web page. Built so a Mac that cannot run
@@ -50,7 +50,7 @@ ability to send.
 
 Persistence is a **cron** entry running `keepalive.sh` every minute:
 
-    * * * * * $HOME/src/imsg-web/keepalive.sh
+    * * * * * $HOME/src/messages-proxy/keepalive.sh
 
 ## New conversations and unread
 

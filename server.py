@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""imsg-web — read and send iMessage/SMS through a LAN web page.
+"""messages-proxy — read and send iMessage/SMS through a LAN web page.
 
 Reads ~/Library/Messages/chat.db (read-only) for history and incoming messages,
 and drives Messages.app via AppleScript to send. Standard library only.
@@ -55,7 +55,7 @@ def _snapshot_path():
         if _snap["dir"] and now - _snap["at"] < SNAP_TTL:
             return os.path.join(_snap["dir"], "chat.db")
         d = _snap["dir"] or os.path.join(
-            os.environ.get("TMPDIR", "/tmp"), "imsg-web-snap"
+            os.environ.get("TMPDIR", "/tmp"), "messages-proxy-snap"
         )
         os.makedirs(d, exist_ok=True)
         for suffix in ("", "-wal", "-shm"):
@@ -566,7 +566,7 @@ def mark_unread(guid):
 # ------------------------------------------------------------------------ server
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "imsg-web"
+    server_version = "messages-proxy"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
@@ -1167,7 +1167,7 @@ def main():
     srv = ThreadingHTTPServer((BIND, PORT), Handler)
     srv.daemon_threads = True
     sys.stderr.write(
-        "imsg-web on http://%s:%d/%s\n"
+        "messages-proxy on http://%s:%d/%s\n"
         % (BIND, PORT, ("?t=" + TOKEN) if TOKEN else "")
     )
     try:
