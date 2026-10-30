@@ -2,3 +2,4 @@ state.db
 __pycache__/
 imsg-web.log
 imsg-web.pid
+token

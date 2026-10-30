@@ -13,5 +13,8 @@ PIDFILE=imsg-web.pid
 if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
 	exit 0
 fi
+# token file (mode 600, gitignored) gates the server when it's reachable from
+# outside the LAN via Tailscale Funnel. Remove the file to go back to open access.
+[ -f token ] && export IMSG_TOKEN="$(cat token)"
 nohup /usr/bin/python3 server.py >> imsg-web.log 2>&1 &
 echo $! > "$PIDFILE"

@@ -38,7 +38,15 @@ Messages.app (a locked-down work machine) can still use iMessage in a browser.
     python3 server.py                      # http://<host>:8787
     IMSG_TOKEN=secret python3 server.py    # then open /?t=secret
 
-No auth by default: anyone on the LAN can read and send. Set `IMSG_TOKEN` to change that.
+Auth: if a `token` file exists (mode 600, gitignored), `keepalive.sh` exports it as
+`IMSG_TOKEN` and every request needs `?t=<token>` once, which sets a session cookie.
+Delete the file to go back to open LAN access.
+
+**Keep the token in place whenever the server is reachable from outside the LAN.**
+A Tailscale Funnel hostname gets a public Let's Encrypt cert, so it appears in
+Certificate Transparency logs and gets scanned within minutes of being created —
+an unauthenticated Funnel would hand strangers the whole message history and the
+ability to send.
 
 Persistence is a **cron** entry running `keepalive.sh` every minute:
 
