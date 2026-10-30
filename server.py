@@ -16,10 +16,12 @@ import os
 import re
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import threading
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -47,6 +49,11 @@ APPLE_EPOCH = 978307200  # 2001-01-01 UTC, in Unix seconds
 PORT = int(os.environ.get("IMSG_PORT", "8787"))
 BIND = os.environ.get("IMSG_BIND", "0.0.0.0")
 TOKEN = os.environ.get("IMSG_TOKEN") or None
+
+# A year, so a home-screen app does not fall back to 401 once its webview is
+# evicted and the session cookie goes with it.
+COOKIE = "imsg=%s; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax"
+ICON_CACHE_HDR = {"Cache-Control": "public, max-age=604800"}
 
 # Inline images are transcoded to JPEG and capped at this longest edge. Phone
 # photos arrive as ~4 MB HEIC, which no browser but Safari can decode at all.
@@ -825,8 +832,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        for k, v in (extra or {}).items():
+        extra = extra or {}
+        if "Cache-Control" not in extra:
+            self.send_header("Cache-Control", "no-store")
+        for k, v in extra.items():
             self.send_header(k, v)
         self.end_headers()
         if self.command != "HEAD":
@@ -838,7 +847,7 @@ class Handler(BaseHTTPRequestHandler):
         if ("imsg=" + TOKEN) in (self.headers.get("Cookie") or ""):
             return True, None
         if (query.get("t") or [None])[0] == TOKEN:
-            return True, {"Set-Cookie": "imsg=%s; Path=/; HttpOnly; SameSite=Lax" % TOKEN}
+            return True, {"Set-Cookie": COOKIE % TOKEN}
         return False, None
 
     def _body(self):
@@ -855,6 +864,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         url = urlparse(self.path)
         q = parse_qs(url.query)
+
+        # Icons and the manifest stay open: iOS and Android fetch them without
+        # the session cookie, and a 401 there means a blank home-screen tile.
+        path = ICON_ALIASES.get(url.path, url.path)
+        if path in ICON_ROUTES:
+            return self._send(200, icon_png(path), "image/png", ICON_CACHE_HDR)
+        if url.path == "/favicon.ico":
+            return self._send(200, FAVICON, "image/svg+xml", ICON_CACHE_HDR)
+        if url.path == "/manifest.webmanifest":
+            return self._send(200, MANIFEST, "application/manifest+json",
+                              ICON_CACHE_HDR)
+
         ok, cookie = self._authorized(q)
         if not ok:
             return self._send(401, "Unauthorized\n", "text/plain")
@@ -862,8 +883,6 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if url.path == "/":
                 return self._send(200, PAGE, "text/html; charset=utf-8", cookie)
-            if url.path == "/favicon.ico":
-                return self._send(200, FAVICON, "image/svg+xml")
             if url.path == "/api/chats":
                 limit = min(int((q.get("limit") or [120])[0]), 500)
                 return self._send(200, {"chats": list_chats(limit)}, extra=cookie)
@@ -983,19 +1002,161 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(500, {"error": str(exc)})
 
 
+# -- app icon
+#
+# One glyph, rendered two ways: an SVG for browser tabs and PNGs for the
+# home-screen/manifest sizes. iOS ignores SVG icons, and Pillow is not an
+# option here (stdlib only), so the PNGs are rasterized by hand below --
+# a gradient rounded square with a white speech bubble on it.
+
+ICON_BG_TOP = (0x4c, 0x8d, 0xff)
+ICON_BG_BOT = (0x1d, 0x6b, 0xff)
+
+# Normalized glyph geometry, shared by the SVG and the rasterizer.
+BUBBLE = (0.180, 0.200, 0.820, 0.655, 0.150)       # x0, y0, x1, y1, radius
+TAIL = ((0.330, 0.600), (0.480, 0.628), (0.238, 0.812))
+SQUARE_R = 0.2232                                   # iOS-ish corner radius
+
 FAVICON = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
-    '<rect width="64" height="64" rx="14" fill="#2b7cff"/>'
-    '<path d="M32 14c-10 0-18 6.5-18 14.5 0 4.6 2.7 8.7 6.9 11.3-.4 2.6-1.6 5.3-3.4 7.4'
-    ' 3.9-.6 7.3-2.3 9.8-4.3 1.5.3 3.1.5 4.7.5 10 0 18-6.5 18-14.9S42 14 32 14z"'
-    ' fill="#fff"/></svg>'
+    '<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">'
+    '<stop offset="0" stop-color="#4c8dff"/><stop offset="1" stop-color="#1d6bff"/>'
+    '</linearGradient></defs>'
+    '<rect width="64" height="64" rx="14.3" fill="url(#g)"/>'
+    '<path d="M38.4 38.4 15.2 52 21.1 41.9Z" fill="#fff"/>'
+    '<rect x="11.5" y="12.8" width="41" height="29.1" rx="9.6" fill="#fff"/>'
+    '</svg>'
 )
+
+
+def _round_rect_hit(u, v, x0, y0, x1, y1, r):
+    if u < x0 or u > x1 or v < y0 or v > y1:
+        return False
+    cx = min(max(u, x0 + r), x1 - r)
+    cy = min(max(v, y0 + r), y1 - r)
+    dx, dy = u - cx, v - cy
+    return dx * dx + dy * dy <= r * r
+
+
+def _tri_hit(u, v, tri):
+    (ax, ay), (bx, by), (cx, cy) = tri
+    d1 = (bx - ax) * (v - ay) - (by - ay) * (u - ax)
+    d2 = (cx - bx) * (v - by) - (cy - by) * (u - bx)
+    d3 = (ax - cx) * (v - cy) - (ay - cy) * (u - cx)
+    return (d1 >= 0 and d2 >= 0 and d3 >= 0) or (d1 <= 0 and d2 <= 0 and d3 <= 0)
+
+
+def _png_bytes(size, rgba):
+    """Pack a size x size RGBA buffer into a PNG."""
+    stride = size * 4
+    raw = bytearray()
+    for y in range(size):
+        raw.append(0)                               # filter type 0
+        raw += rgba[y * stride:(y + 1) * stride]
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+            + chunk(b"IEND", b""))
+
+
+def render_icon(size, rounded=True, glyph=1.0):
+    """Rasterize the icon. rounded=False is full-bleed (iOS and maskable both
+    apply their own mask); glyph shrinks the bubble inside the safe zone."""
+    ss = 4 if size <= 64 else 2                     # supersampling for edges
+    n = float(ss * ss)
+    bx0, by0, bx1, by1, br = BUBBLE
+    sq_r = SQUARE_R if rounded else 0.0
+    rgba = bytearray(size * size * 4)
+    i = 0
+    for py in range(size):
+        for px in range(size):
+            sq = bub = 0
+            for sy in range(ss):
+                v = (py + (sy + 0.5) / ss) / size
+                for sx in range(ss):
+                    u = (px + (sx + 0.5) / ss) / size
+                    if sq_r and not _round_rect_hit(u, v, 0.0, 0.0, 1.0, 1.0, sq_r):
+                        continue
+                    sq += 1
+                    gu, gv = (u - 0.5) / glyph + 0.5, (v - 0.5) / glyph + 0.5
+                    if (_round_rect_hit(gu, gv, bx0, by0, bx1, by1, br)
+                            or _tri_hit(gu, gv, TAIL)):
+                        bub += 1
+            if not sq:
+                i += 4
+                continue
+            t = (py + 0.5) / size
+            w = bub / float(sq)                     # white coverage, clipped
+            for c in range(3):
+                g = ICON_BG_TOP[c] + (ICON_BG_BOT[c] - ICON_BG_TOP[c]) * t
+                rgba[i + c] = int(g + (255 - g) * w + 0.5)
+            rgba[i + 3] = int(255 * sq / n + 0.5)
+            i += 4
+    return _png_bytes(size, rgba)
+
+
+# path -> (size, rounded, glyph); rendered on first request, then cached.
+ICON_ROUTES = {
+    "/icon-32.png": (32, True, 1.0),
+    "/icon-180.png": (180, False, 1.0),
+    "/icon-192.png": (192, True, 1.0),
+    "/icon-512.png": (512, True, 1.0),
+    "/icon-maskable-512.png": (512, False, 0.74),
+}
+ICON_ALIASES = {
+    "/apple-touch-icon.png": "/icon-180.png",
+    "/apple-touch-icon-precomposed.png": "/icon-180.png",
+    "/apple-touch-icon-180x180.png": "/icon-180.png",
+}
+_ICON_CACHE = {}
+_ICON_LOCK = threading.Lock()
+
+
+def icon_png(path):
+    with _ICON_LOCK:
+        if path not in _ICON_CACHE:
+            _ICON_CACHE[path] = render_icon(*ICON_ROUTES[path])
+        return _ICON_CACHE[path]
+
+
+MANIFEST = {
+    "name": "Messages",
+    "short_name": "Messages",
+    "description": "iMessage and SMS from this Mac, in a browser.",
+    "start_url": "/",
+    "scope": "/",
+    "display": "standalone",
+    "orientation": "any",
+    "background_color": "#1c1c1e",
+    "theme_color": "#1c1c1e",
+    "icons": [
+        {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+        {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"},
+        {"src": "/icon-maskable-512.png", "sizes": "512x512",
+         "type": "image/png", "purpose": "maskable"},
+    ],
+}
 
 PAGE = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Messages</title>
+<link rel="icon" href="/favicon.ico" type="image/svg+xml">
+<link rel="icon" href="/icon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#f6f6f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#141416" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Messages">
 <style>
   :root {
     --bg: #ffffff; --bg-side: #f6f6f7; --line: #e3e3e6; --fg: #1d1d1f;
@@ -1024,6 +1185,7 @@ PAGE = r"""<!doctype html>
     background: var(--bg-side); display: flex; flex-direction: column;
   }
   #side h1 {
+    padding-top: calc(14px + env(safe-area-inset-top));
     font-size: 13px; text-transform: uppercase; letter-spacing: .07em;
     color: var(--dim); margin: 0; padding: 14px 16px 10px; font-weight: 600;
     display: flex; justify-content: space-between; align-items: center;
@@ -1070,7 +1232,7 @@ PAGE = r"""<!doctype html>
   .chat.sel .badge { background: #fff; color: var(--accent); }
   #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   #head {
-    padding: 12px 18px; border-bottom: 1px solid var(--line); font-weight: 600;
+    padding: calc(12px + env(safe-area-inset-top)) 18px 12px; border-bottom: 1px solid var(--line); font-weight: 600;
     display: flex; justify-content: space-between; align-items: center; gap: 12px;
   }
   #head .sub { font-weight: 400; color: var(--dim); font-size: 12px; }
@@ -1090,7 +1252,10 @@ PAGE = r"""<!doctype html>
   .bubble img { max-width: 100%; border-radius: 10px; display: block; margin: 4px 0; }
   .bubble .note { font-size: 12.5px; opacity: .72; font-style: italic; }
   .bubble a { color: inherit; }
-  #composer { border-top: 1px solid var(--line); padding: 12px; display: flex; gap: 8px; }
+  #composer {
+    border-top: 1px solid var(--line); display: flex; gap: 8px;
+    padding: 12px 12px calc(12px + env(safe-area-inset-bottom));
+  }
   #text {
     flex: 1; resize: none; padding: 9px 12px; border: 1px solid var(--line);
     border-radius: 18px; background: var(--bg); color: var(--fg); font: inherit;

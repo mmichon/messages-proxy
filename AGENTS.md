@@ -142,6 +142,31 @@ Messages.app on this Mac and your iPhone keep their own read state and will not 
 the thread as unread. The UI deselects the thread afterwards, otherwise the open
 thread would immediately re-mark itself seen.
 
+## App icon / installing it
+
+The page is installable (Add to Home Screen on iOS, Install on Chrome). The icon
+is **one glyph rendered two ways**: `FAVICON` is an SVG for browser tabs, and the
+home-screen sizes are rasterized by `render_icon()` — pure stdlib (`zlib` +
+`struct`), because iOS ignores SVG icons and Pillow is not a dependency here.
+Geometry lives once in `BUBBLE` / `TAIL` / `SQUARE_R` as 0..1 coordinates, shared
+by both; if you move the glyph, move it in both or they drift.
+
+- `ICON_ROUTES` maps path → (size, rounded, glyph scale). `rounded=False` is
+  full-bleed, for `/apple-touch-icon.png` (iOS applies its own mask — a rounded
+  PNG there gets double-rounded corners) and for the maskable manifest icon,
+  whose glyph is shrunk to 0.74 to stay inside the safe zone.
+- Rendering is supersampled in Python: 512px takes ~0.5s, so results are cached
+  in `_ICON_CACHE` on first request. Don't render eagerly at startup.
+- **Icons and `/manifest.webmanifest` are served before the token check.** iOS and
+  Android fetch them without the session cookie, and a 401 there is a blank
+  home-screen tile. They expose nothing.
+- The auth cookie carries `Max-Age` (1 year). A session cookie dies when the
+  standalone webview is evicted, which showed up as a bare "Unauthorized" page in
+  the installed app.
+- `viewport-fit=cover` plus `env(safe-area-inset-*)` on `#side h1`, `#head` and
+  `#composer` — standalone mode has no browser chrome, so without it the header
+  sits under the notch and the composer under the home indicator.
+
 ## Remote access (Tailscale Funnel)
 
 Reachable from anywhere at **https://macbook-air.tail823fbf.ts.net** — nothing is
