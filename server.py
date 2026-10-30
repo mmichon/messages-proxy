@@ -33,6 +33,7 @@ ADDRESSBOOK_GLOB = os.path.join(
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_DB = os.path.join(APP_DIR, "state.db")
 SEND_SCRIPT = os.path.join(APP_DIR, "send.applescript")
+NEW_SCRIPT = os.path.join(APP_DIR, "new.applescript")
 
 APPLE_EPOCH = 978307200  # 2001-01-01 UTC, in Unix seconds
 
@@ -479,6 +480,89 @@ def send_message(guid, text):
     return False, " | ".join(errors)
 
 
+def start_conversation(handle, text):
+    """Send to a handle with no existing chat. `chat id` can't create one, so this
+    goes through `participant ... of account`, which does."""
+    proc = subprocess.run(
+        ["osascript", NEW_SCRIPT, handle, text],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if proc.returncode != 0:
+        return False, (proc.stderr or "send failed").strip(), None
+    service = (proc.stdout or "").strip()
+    # Messages creates the chat asynchronously; give it a moment to land.
+    for _ in range(12):
+        guid = find_chat_for_handle(handle)
+        if guid:
+            return True, service, guid
+        time.sleep(0.5)
+    return True, service, None
+
+
+def find_chat_for_handle(handle):
+    """Newest chat whose identifier matches this handle (phones compared by last 10)."""
+    con = chat_db()
+    try:
+        rows = con.execute(
+            "select c.guid, c.chat_identifier, max(m.ROWID) as mid "
+            "from chat c join chat_message_join cmj on cmj.chat_id = c.ROWID "
+            "join message m on m.ROWID = cmj.message_id "
+            "group by c.ROWID order by mid desc limit 400"
+        ).fetchall()
+    finally:
+        con.close()
+
+    if "@" in handle:
+        want = handle.strip().lower()
+        for r in rows:
+            if (r["chat_identifier"] or "").strip().lower() == want:
+                return r["guid"]
+        return None
+
+    want = _phone_key(handle)
+    if not want:
+        return None
+    for r in rows:
+        if _phone_key(r["chat_identifier"] or "") == want:
+            return r["guid"]
+    return None
+
+
+def mark_unread(guid):
+    """Rewind our seen marker to just before the last incoming message.
+
+    Only affects this web UI's badge — chat.db is never written, so Messages.app
+    and your other devices keep their own read state.
+    """
+    con = chat_db()
+    try:
+        row = con.execute(
+            "select max(m.ROWID) from chat_message_join cmj "
+            "join message m on m.ROWID = cmj.message_id "
+            "where cmj.chat_id = (select ROWID from chat where guid = ?) "
+            "and m.is_from_me = 0 and m.item_type = 0",
+            (guid,),
+        ).fetchone()
+    finally:
+        con.close()
+    last_in = row[0] if row else None
+    if not last_in:
+        return False
+    st = state_db()
+    try:
+        st.execute(
+            "insert into seen values (?,?) on conflict(chat_guid) "
+            "do update set rowid_seen = excluded.rowid_seen",
+            (guid, last_in - 1),
+        )
+        st.commit()
+    finally:
+        st.close()
+    return True
+
+
 # ------------------------------------------------------------------------ server
 
 class Handler(BaseHTTPRequestHandler):
@@ -582,6 +666,31 @@ class Handler(BaseHTTPRequestHandler):
                 if sent:
                     return self._send(200, {"ok": True, "via": info}, extra=cookie)
                 return self._send(502, {"ok": False, "error": info})
+            if url.path == "/api/new":
+                handle = (body.get("handle") or "").strip()
+                text = body.get("text") or ""
+                if not handle or not text.strip():
+                    return self._send(400, {"error": "handle and text required"})
+                existing = find_chat_for_handle(handle)
+                if existing:
+                    # Already have a thread with them; use the normal path.
+                    sent, info = send_message(existing, text)
+                    if not sent:
+                        return self._send(502, {"ok": False, "error": info})
+                    return self._send(200, {"ok": True, "chat": existing}, extra=cookie)
+                sent, info, guid = start_conversation(handle, text)
+                if not sent:
+                    return self._send(502, {"ok": False, "error": info})
+                return self._send(
+                    200, {"ok": True, "chat": guid, "service": info}, extra=cookie
+                )
+            if url.path == "/api/unread":
+                guid = (body.get("chat") or "").strip()
+                if not guid:
+                    return self._send(400, {"error": "chat required"})
+                return self._send(
+                    200, {"ok": mark_unread(guid)}, extra=cookie
+                )
             if url.path == "/api/seen":
                 guid = (body.get("chat") or "").strip()
                 upto = int(body.get("upto") or 0)
@@ -646,7 +755,24 @@ PAGE = r"""<!doctype html>
   #side h1 {
     font-size: 13px; text-transform: uppercase; letter-spacing: .07em;
     color: var(--dim); margin: 0; padding: 14px 16px 10px; font-weight: 600;
+    display: flex; justify-content: space-between; align-items: center;
   }
+  #new {
+    border: 0; background: none; color: var(--accent); font: inherit;
+    font-size: 12px; font-weight: 600; cursor: pointer; padding: 0;
+    text-transform: none; letter-spacing: 0;
+  }
+  #to {
+    margin: 0 12px 10px; padding: 7px 10px; border: 1px solid var(--accent);
+    border-radius: 8px; background: var(--bg); color: var(--fg); font: inherit;
+    display: none;
+  }
+  #head button.ghost {
+    border: 1px solid var(--line); background: none; color: var(--dim);
+    border-radius: 7px; padding: 4px 9px; font: inherit; font-size: 12px;
+    cursor: pointer;
+  }
+  #head button.ghost:hover { color: var(--fg); }
   #search {
     margin: 0 12px 10px; padding: 7px 10px; border: 1px solid var(--line);
     border-radius: 8px; background: var(--bg); color: var(--fg); font: inherit;
@@ -713,12 +839,17 @@ PAGE = r"""<!doctype html>
 </style>
 </head><body>
 <aside id="side">
-  <h1>Messages</h1>
+  <h1>Messages <button id="new">+ New</button></h1>
+  <input id="to" placeholder="Phone number or email, then type below" autocomplete="off">
   <input id="search" placeholder="Filter conversations" autocomplete="off">
   <div id="chats"></div>
 </aside>
 <section id="main">
-  <div id="head"><span id="title">Pick a conversation</span><span class="sub" id="sub"></span></div>
+  <div id="head">
+    <span id="title">Pick a conversation</span>
+    <span class="sub" id="sub"></span>
+    <button class="ghost" id="markunread" style="display:none">Mark unread</button>
+  </div>
   <div id="thread"><div class="empty">Nothing selected</div></div>
   <div id="err"></div>
   <div id="composer">
@@ -728,7 +859,7 @@ PAGE = r"""<!doctype html>
 </section>
 <script>
 const $ = s => document.querySelector(s);
-let chats = [], cur = null, lastId = 0, maxSeen = 0, filter = "";
+let chats = [], cur = null, lastId = 0, maxSeen = 0, filter = "", composing = false;
 
 const fmtWhen = ts => {
   if (!ts) return "";
@@ -779,6 +910,7 @@ function drawChats() {
     }
     el.append(main, right);
     el.onclick = () => open(c);
+    el.oncontextmenu = e => { e.preventDefault(); markUnread(c.guid); };
     box.append(el);
   }
 }
@@ -854,10 +986,64 @@ function drawMessages(msgs, append) {
 }
 let lastTs = 0;
 
-async function open(c) {
-  cur = c;
+async function markUnread(guid) {
+  await api("/api/unread", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({chat: guid}),
+  }).catch(() => {});
+  // Deselect, or the open thread would immediately mark itself seen again.
+  if (cur && cur.guid === guid) closeThread();
+  await refreshChats();
+}
+
+function closeThread() {
+  cur = null;
   lastId = 0;
   lastTs = 0;
+  composing = false;
+  $("#to").style.display = "none";
+  $("#title").textContent = "Pick a conversation";
+  $("#sub").textContent = "";
+  $("#markunread").style.display = "none";
+  $("#thread").textContent = "";
+  const e = document.createElement("div");
+  e.className = "empty";
+  e.textContent = "Nothing selected";
+  $("#thread").append(e);
+  $("#text").disabled = true;
+  $("#send").disabled = true;
+  drawChats();
+}
+
+function startCompose() {
+  cur = null;
+  composing = true;
+  lastId = 0;
+  $("#to").style.display = "block";
+  $("#to").value = "";
+  $("#title").textContent = "New message";
+  $("#sub").textContent = "";
+  $("#markunread").style.display = "none";
+  $("#thread").textContent = "";
+  const e = document.createElement("div");
+  e.className = "empty";
+  e.textContent = "Enter a phone number or email above";
+  $("#thread").append(e);
+  $("#text").disabled = false;
+  $("#send").disabled = false;
+  $("#err").textContent = "";
+  drawChats();
+  $("#to").focus();
+}
+
+async function open(c) {
+  cur = c;
+  composing = false;
+  lastId = 0;
+  lastTs = 0;
+  $("#to").style.display = "none";
+  $("#markunread").style.display = "";
   $("#title").textContent = c.name;
   $("#sub").textContent = [c.service, c.handles.join(", ")].filter(Boolean).join(" · ");
   $("#err").textContent = "";
@@ -910,18 +1096,34 @@ async function tick() {
 
 async function send() {
   const text = $("#text").value;
-  if (!cur || !text.trim()) return;
+  if (!text.trim()) return;
+  const handle = composing ? $("#to").value.trim() : null;
+  if (composing && !handle) { $("#to").focus(); return; }
+  if (!composing && !cur) return;
   $("#send").disabled = true;
   $("#err").textContent = "";
   try {
-    await api("/api/send", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({chat: cur.guid, text}),
-    });
-    $("#text").value = "";
-    $("#text").style.height = "auto";
-    setTimeout(tick, 900);
+    if (composing) {
+      const r = await api("/api/new", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({handle, text}),
+      });
+      $("#text").value = "";
+      $("#text").style.height = "auto";
+      await refreshChats();
+      const c = chats.find(x => x.guid === r.chat);
+      if (c) await open(c); else composing = false;
+    } else {
+      await api("/api/send", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({chat: cur.guid, text}),
+      });
+      $("#text").value = "";
+      $("#text").style.height = "auto";
+      setTimeout(tick, 900);
+    }
   } catch (e) {
     $("#err").textContent = "Send failed — " + e.message;
   } finally {
@@ -931,6 +1133,11 @@ async function send() {
 }
 
 $("#send").onclick = send;
+$("#new").onclick = startCompose;
+$("#markunread").onclick = () => { if (cur) markUnread(cur.guid); };
+$("#to").addEventListener("keydown", e => {
+  if (e.key === "Enter") { e.preventDefault(); $("#text").focus(); }
+});
 $("#text").addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });

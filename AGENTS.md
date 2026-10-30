@@ -52,6 +52,29 @@ Persistence is a **cron** entry running `keepalive.sh` every minute:
 
     * * * * * $HOME/src/imsg-web/keepalive.sh
 
+## New conversations and unread
+
+**Starting a thread with someone you have no chat with** can't go through
+`chat id` — that errors with -1728 for a GUID that doesn't exist. It has to go
+through `participant`:
+
+    send theText to participant theHandle of (1st account whose service type = iMessage)
+
+That's `new.applescript`, with an SMS account as fallback for non-Apple numbers.
+`POST /api/new {handle, text}` uses it, then polls `find_chat_for_handle()` for up
+to 6s because Messages creates the chat row asynchronously. Handles are matched by
+last-10-digits for phones and lowercased string for emails, so "+1 (415) 555-0123"
+finds an existing thread instead of starting a duplicate.
+
+Note `service type of account` raises -10000 when read directly, but the
+`whose service type = iMessage` filter works — don't "simplify" it into a property read.
+
+**Mark unread** (`POST /api/unread`) rewinds this app's `seen` marker to one below
+the chat's last incoming rowid. It is **web-UI only** — chat.db is never written, so
+Messages.app on this Mac and your iPhone keep their own read state and will not show
+the thread as unread. The UI deselects the thread afterwards, otherwise the open
+thread would immediately re-mark itself seen.
+
 ## Remote access (Tailscale Funnel)
 
 Reachable from anywhere at **https://macbook-air.tail823fbf.ts.net** — nothing is
