@@ -37,6 +37,14 @@ ADDRESSBOOK_GLOB = os.path.join(
     HOME, "Library", "Application Support", "AddressBook", "Sources",
     "*", "AddressBook-v22.abcddb",
 )
+# Names people share over iMessage ("Name and Photo Sharing"), for handles that
+# aren't in Contacts at all. Ordered: live shares first, then ones still pending
+# acceptance. archivedNicknamesKeyStore.db is deliberately left out — those are
+# shares that were withdrawn or superseded, so the name there can be stale.
+NICKNAME_DBS = tuple(
+    os.path.join(HOME, "Library", "Messages", "NickNameCache", name)
+    for name in ("handledNicknamesKeyStore.db", "pendingNicknamesKeyStore.db")
+)
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_DB = os.path.join(APP_DIR, "state.db")
 CACHE_DIR = os.path.join(APP_DIR, "cache")
@@ -57,7 +65,9 @@ ICON_CACHE_HDR = {"Cache-Control": "public, max-age=604800"}
 
 # Inline images are transcoded to JPEG and capped at this longest edge. Phone
 # photos arrive as ~4 MB HEIC, which no browser but Safari can decode at all.
-PREVIEW_MAX = 1600
+PREVIEW_MAX = 1200                # bubbles are <=68% wide; 2x DPR covers it
+ATTACH_CACHE = "private, max-age=31536000, immutable"
+CLIENT_GONE = (BrokenPipeError, ConnectionResetError)
 PREVIEW_MIN_BYTES = 512 * 1024   # below this, serve the original untouched
 # Chrome and Firefox decode none of these; Safari only handles HEIC.
 TRANSCODE_MIMES = (
@@ -211,6 +221,65 @@ def _contact_label(first, last, org, nick):
     return name or nick or org or ""
 
 
+def _unarchive_root(blob):
+    """Top-level dict of an NSKeyedArchiver plist, one level deep.
+
+    The nickname rows are a flat NSMutableDictionary, so resolving the root's
+    NS.keys/NS.objects against $objects is enough — no general unarchiver needed.
+    """
+    import plistlib
+
+    plist = plistlib.loads(blob)
+    objects = plist["$objects"]
+
+    def deref(value):
+        return objects[value.data] if isinstance(value, plistlib.UID) else value
+
+    root = deref(plist["$top"]["root"])
+    if not isinstance(root, dict):
+        return {}
+    keys = root.get("NS.keys") or []
+    values = root.get("NS.objects") or []
+    return {deref(k): deref(v) for k, v in zip(keys, values)}
+
+
+def nickname_map():
+    """handle key -> shared name, from the Messages nickname cache.
+
+    Each kvtable row is keyed by the raw handle and holds an NSKeyedArchiver
+    blob with 'dn' (display name) plus 'fn'/'ln'. Covers people who share their
+    name over iMessage but aren't in Contacts; Contacts still wins when both have
+    a name, so this only ever fills gaps.
+    """
+    out = {}
+    for path in NICKNAME_DBS:
+        try:
+            con = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=3)
+        except sqlite3.Error:
+            continue
+        try:
+            rows = con.execute("select key, value from kvtable").fetchall()
+        except sqlite3.Error:
+            rows = []
+        finally:
+            con.close()
+        for handle, blob in rows:
+            key = handle_key(handle)
+            if not key or key in out:
+                continue
+            try:
+                row = _unarchive_root(blob)
+            except Exception:
+                # A malformed or re-versioned row must not cost us every name.
+                continue
+            label = row.get("dn") or " ".join(
+                p for p in (row.get("fn"), row.get("ln")) if p
+            ).strip()
+            if isinstance(label, str) and label:
+                out[key] = label
+    return out
+
+
 def contact_map():
     """handle (phone key or lowercased email) -> display name, from all Contacts sources."""
     import glob
@@ -252,6 +321,11 @@ def contact_map():
                             out.setdefault(key, label)
             finally:
                 con.close()
+
+        # Shared names fill handles Contacts has nothing for; setdefault keeps
+        # the user's own Contacts entry authoritative when both have a name.
+        for key, label in nickname_map().items():
+            out.setdefault(key, label)
 
         _contacts["map"] = out
         _contacts["at"] = now
@@ -363,6 +437,9 @@ def list_chats(limit=120):
                     "guid": guid,
                     "name": name,
                     "handles": handles,
+                    # Same order as handles, each resolved to a name where one
+                    # exists; the thread subtitle shows these instead of digits.
+                    "names": pretty,
                     "service": r["service_name"],
                     "preview": preview_of(r),
                     "ts": apple_ts(r["date"]),
@@ -917,11 +994,17 @@ class Handler(BaseHTTPRequestHandler):
                 if not got:
                     return self._send(404, "not found\n", "text/plain")
                 mime, name, data = got
+                # An attachment rowid's bytes never change, so the browser may
+                # keep them. With no-store, reopening a thread re-pulled every
+                # image over Funnel -- ~10s each from a remote browser.
                 return self._send(
                     200, data, mime,
-                    {"Content-Disposition": content_disposition(name)},
+                    {"Content-Disposition": content_disposition(name),
+                     "Cache-Control": ATTACH_CACHE},
                 )
             return self._send(404, {"error": "not found"})
+        except CLIENT_GONE:
+            return                    # tab closed or image dropped mid-transfer
         except Exception as exc:  # keep the server up; surface the cause
             self.log_message("error on %s: %r", url.path, exc)
             return self._send(500, {"error": str(exc)})
@@ -1250,6 +1333,7 @@ PAGE = r"""<!doctype html>
   .meta { font-size: 11px; color: var(--dim); margin: 2px 4px 0; }
   .meta .fail { color: var(--err); font-weight: 600; }
   .bubble img { max-width: 100%; border-radius: 10px; display: block; margin: 4px 0; }
+  .note.retry { cursor: pointer; }
   .bubble .note { font-size: 12.5px; opacity: .72; font-style: italic; }
   .bubble a { color: inherit; }
   #composer {
@@ -1393,10 +1477,25 @@ function drawMessages(msgs, append) {
         img.loading = "lazy";
         img.src = "/api/attachment?id=" + a.id;
         img.alt = a.name;
+        // Over Funnel a request can be dropped before it reaches the server;
+        // retry a couple of times before calling the image unavailable, and
+        // leave the note clickable for one more go.
+        let tries = 0;
         img.onerror = () => {
+          if (tries < 2) {
+            tries++;
+            setTimeout(() => { img.src = "/api/attachment?id=" + a.id + "&try=" + tries; },
+                       1500 * tries);
+            return;
+          }
           const n = document.createElement("div");
-          n.className = "note";
-          n.textContent = "\u{1F4CE} " + (a.name || "image") + " — unavailable";
+          n.className = "note retry";
+          n.textContent = "\u{1F4CE} " + (a.name || "image") + " — unavailable, tap to retry";
+          n.onclick = () => {
+            tries = 1;
+            img.src = "/api/attachment?id=" + a.id + "&try=" + Date.now();
+            n.replaceWith(wrap);
+          };
           wrap.replaceWith(n);
         };
         wrap.append(img);
@@ -1494,7 +1593,8 @@ async function open(c) {
   $("#to").style.display = "none";
   $("#markunread").style.display = "";
   $("#title").textContent = c.name;
-  $("#sub").textContent = [c.service, c.handles.join(", ")].filter(Boolean).join(" · ");
+  const who = (c.names && c.names.length ? c.names : c.handles).join(", ");
+  $("#sub").textContent = [c.service, who].filter(Boolean).join(" · ");
   $("#err").textContent = "";
   $("#text").disabled = false;
   $("#send").disabled = false;
@@ -1621,6 +1721,15 @@ setInterval(tick, 3000);
 """
 
 
+class Server(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        # A browser dropping a connection (Funnel resets, a thread switched
+        # mid-load) is routine; only print tracebacks for real failures.
+        if isinstance(sys.exc_info()[1], CLIENT_GONE):
+            return
+        super().handle_error(request, client_address)
+
+
 def main():
     if not os.path.exists(CHAT_DB):
         sys.exit("chat.db not found at %s" % CHAT_DB)
@@ -1631,7 +1740,7 @@ def main():
             "cannot read chat.db (%s)\n"
             "Grant Full Disk Access to this Python binary: %s" % (exc, sys.executable)
         )
-    srv = ThreadingHTTPServer((BIND, PORT), Handler)
+    srv = Server((BIND, PORT), Handler)
     srv.daemon_threads = True
     sys.stderr.write(
         "messages-proxy on http://%s:%d/%s\n"

@@ -36,6 +36,48 @@ Messages.app (a locked-down work machine) can still use iMessage in a browser.
 - AppleScript `send ... to chat id` works here, but `service type of account` raises
   -10000 — don't rely on account properties.
 
+## Names (resolving handles to people)
+
+`pretty_handle()` turns a handle into a name via `contact_map()`, keyed by
+`handle_key()` so the normalization can't drift from the matching code. Two
+sources, merged with `setdefault` so **Contacts always wins**:
+
+1. **Contacts** — every `AddressBook-v22.abcddb` under `Sources/*`, read
+   `mode=ro`. Nine sources exist here but only the Google CardDAV one has phone
+   data (1768 numbers); the iCloud source holds 3 contacts, LinkedIn has names
+   but no phones. Don't hard-code the UUID — sources are recreated when an
+   account is re-added. `ZFULLNUMBER` is stored unnormalized (`415.503.7118`,
+   `(213) 364-1300`, `+1847…`), and `ZCOUNTRYCODE`/`ZAREACODE`/`ZLOCALNUMBER` are
+   empty on every row, so last-10-digits (`_phone_key`) is the only thing that
+   works.
+2. **Shared names** — `NickNameCache/{handled,pending}NicknamesKeyStore.db`, the
+   names people share over iMessage ("Name and Photo Sharing"). This is how
+   Messages.app labels someone who isn't in Contacts at all. ~137 handles here.
+   `archivedNicknamesKeyStore.db` is **deliberately excluded** — withdrawn or
+   superseded shares, so the name can be stale.
+
+Each nickname row is `kvtable(key = raw handle, value = NSKeyedArchiver plist)`
+with `dn` (display name) plus `fn`/`ln`. `_unarchive_root()` resolves the root's
+`NS.keys`/`NS.objects` against `$objects` one level deep — the row is a flat
+dictionary, so a general unarchiver isn't needed. A row that fails to decode is
+skipped individually; one re-versioned blob must not cost every other name.
+
+The whole map is built in ~0.05s and cached for `CONTACTS_TTL` (600s).
+
+**`chat.db` cannot help here.** The `handle` table has no name column at all
+(`id`, `country`, `service`, `uncanonicalized_id`, `person_centric_id`), and
+`chat.display_name` is set on only 263 of 3687 group chats — so ~93% of groups
+must be labeled from their participants.
+
+**Not every number resolves, and that's not a bug.** A handle absent from both
+sources has no name anywhere on this Mac; Messages.app shows it as digits too.
+`pretty_handle()` returns the raw handle in that case.
+
+`list_chats()` ships both `handles` (raw, in participant order) and `names` (the
+same order, resolved). Both are needed: the thread subtitle renders `names`,
+while sending and the group-sender gate (`cur.handles.length > 1`) need the raw
+handles. A resolved name must never be fed back into a send path.
+
 ## Images and attachments
 
 `/api/attachment?id=<rowid>` serves a **browser-safe JPEG**; `&full=1` is the same
@@ -52,8 +94,18 @@ locally because Safari was fine.
 - Converted files are cached in `cache/` (gitignored), keyed by rowid + source
   mtime + size + cap, pruned oldest-first past 300 MB. A ~4 MB HEIC takes ~0.25s
   once, then ~1ms — worth having, since every open tab re-fetches on poll.
-- Inline previews cap the longest edge at `PREVIEW_MAX` (1600): 3.6 MB → ~700 KB,
-  which matters over Funnel. Clicking the image opens `&full=1`.
+- Inline previews cap the longest edge at `PREVIEW_MAX` (1200, enough for a
+  ≤68%-wide bubble at 2x): a 4032px HEIC → ~280 KB, which matters over Funnel.
+  Clicking the image opens `&full=1`.
+- **The bottleneck is Funnel, not sips.** Locally a preview is 0.2s cold, 1ms
+  cached; from a remote browser it was ~10s per image. Successful attachment
+  responses carry `ATTACH_CACHE` (`private, max-age=1y, immutable` — a rowid's
+  bytes never change) so reopening a thread doesn't re-pull everything; it used
+  to be the default `no-store`. 404s stay `no-store`.
+- Funnel also drops connections before they reach the server (no log line at
+  all for that image). The `<img>` retries twice with backoff before showing
+  "unavailable, tap to retry". `BrokenPipeError`/`ConnectionResetError`
+  (`CLIENT_GONE`) are swallowed rather than 500'd and traced into the log.
 - GIFs are never converted (sips would flatten the animation), and formats the
   browser already handles are only shrunk if they're over `PREVIEW_MIN_BYTES`
   and the JPEG actually comes out smaller. HEIC/TIFF are converted regardless.
