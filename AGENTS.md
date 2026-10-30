@@ -235,6 +235,57 @@ Notes:
 - Funnel required a one-time enable on the tailnet in the admin console.
 - First visit needs `?t=<token>`; after that an HttpOnly cookie carries it.
 
+## LAN mode and load speed
+
+Server work is never the slow part (chats ~5–50 ms, a thread ≤6 ms, a cached
+preview ~1 ms). The time is all in **round trips through Funnel**: a browser on
+the home Wi-Fi that opens the `ts.net` URL goes out to Tailscale's relay and
+back for every request. So the page moves itself onto the LAN when it can:
+
+- Funnel requests reach the server from tailscaled on loopback carrying
+  `Tailscale-Funnel-Request: ?1` and `X-Forwarded-For: <client public IP>`.
+  `Handler._route()` trusts those headers only from loopback.
+- `tailscale_self()` reads `status --json` (cached 5 min). `Self.Addrs` holds
+  the endpoints Tailscale discovered: the global one is this NAT's public IP
+  (no "what's my IP" service), the private one is the LAN address. **Don't**
+  find the LAN IP from the routing table — with Tailscale owning the default
+  route that returns the 100.x tunnel address.
+- `GET /api/net` says `via` (funnel/lan/tailnet/local) and `same_lan` (Funnel
+  client's public IP is ours), plus a **one-time handoff code**. `/?h=<code>`
+  trades it for the cookie and 302s to `/`, so the token itself never rides in
+  a plain-http URL. Codes are single-use and expire after 120 s.
+- The Funnel page then probes `http://<lan>:8787/ping` (open, CORS `*`, returns
+  the per-process `INSTANCE` so a different device at that IP doesn't count)
+  and navigates there if it answers. An https page can only fetch a private
+  http address in Chrome, via `fetch(..., {targetAddressSpace: "local"})`
+  (Local Network Access; prompts once). Safari/iOS block it as mixed content,
+  so the probe fails quietly and the header shows a **"use LAN"** link instead.
+  Installed (standalone) apps are never switched — leaving the origin would
+  pop them out of the app.
+- On the LAN origin, three failed polls make the page check Funnel's `/ping`
+  and move back there — only if Funnel answers, so a server restart doesn't
+  bounce it. Clicking "· LAN" goes back to Funnel and sets
+  `localStorage imsg-net=funnel`, which stops auto-switching on that browser.
+- The LAN origin is plain http, so its cookie crosses the home network in the
+  clear. That's the trade for skipping the internet.
+
+Other speedups, which help on either path:
+
+- JSON, the page and SVG are **gzipped** when over 1 KB (page 18→8 KB, chat
+  list 37→10 KB).
+- The client keeps threads **in memory** (`threads` map, never localStorage —
+  nothing is left on the disk of a work machine). Opening a cached thread draws
+  immediately; the full fetch still runs and redraws only if the JSON differs,
+  which covers failed sends, edits and unsends.
+- `prefetch()` loads the top 8 threads that changed since cached, after the
+  first load and after every poll that changed something. On a fast path
+  (`via` lan/local) it also warms the newest images into the browser cache.
+- `attachments_for()` queues the newest `PREWARM_IMAGES` previews of a thread
+  for `sips` on two background workers, so the `<img>` requests that follow
+  are cache hits rather than a 0.25 s conversion each.
+- Images keep the thread pinned to the bottom as they load (`pinned`), unless
+  the reader has scrolled up.
+
 ## Disk use
 
 Nothing here may grow without bound:

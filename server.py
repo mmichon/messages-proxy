@@ -10,8 +10,12 @@ Env:
   IMSG_TOKEN  if set, require ?t=<token> once, then a session cookie
 """
 
+import gzip
+import ipaddress
 import json
 import mimetypes
+import queue
+import secrets
 import os
 import re
 import shutil
@@ -75,6 +79,18 @@ TRANSCODE_MIMES = (
     "image/tiff", "image/x-adobe-dng",
 )
 CACHE_MAX_BYTES = 300 * 1024 * 1024
+PREWARM_IMAGES = 24              # newest images per thread converted ahead of time
+
+# LAN mode: a browser on the home network that reached us through Funnel is
+# making a round trip through Tailscale's relay for every request. When its
+# public IP is ours, the page is told the LAN address and switches to it.
+TAILSCALE = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+NET_TTL = 300.0
+HANDOFF_TTL = 120.0
+# Lets the page check that the LAN address is really this server, not
+# whatever else holds that IP on some other network.
+INSTANCE = secrets.token_hex(8)
+GZIP_TYPES = ("application/json", "text/", "image/svg+xml", "application/manifest+json")
 
 # ---------------------------------------------------------------- chat.db access
 
@@ -496,6 +512,7 @@ def attachments_for(con, message_ids):
         message_ids,
     ).fetchall()
     out = {}
+    convert = []
     for r in rows:
         name = r["transfer_name"] or ""
         if name.endswith(".pluginPayloadAttachment"):
@@ -503,6 +520,8 @@ def attachments_for(con, message_ids):
         mime = r["mime_type"] or mimetypes.guess_type(name)[0] or ""
         # Attachments can be iCloud-offloaded or purged; the row outlives the file.
         local = attachment_path(r["filename"])
+        if local and (mime in TRANSCODE_MIMES or wants_preview(mime, r["total_bytes"] or 0)):
+            convert.append((r["aid"], local))
         out.setdefault(r["mid"], []).append(
             {
                 "id": r["aid"],
@@ -513,6 +532,11 @@ def attachments_for(con, message_ids):
                 "available": bool(local),
             }
         )
+    # The browser asks for these as soon as the thread renders; start the
+    # sips conversions now so they're cache hits by then. Newest first.
+    convert.sort(reverse=True)
+    for item in convert[:PREWARM_IMAGES]:
+        prewarm(*item)
     return out
 
 
@@ -662,6 +686,35 @@ def preview_jpeg(aid, path, cap=PREVIEW_MAX):
         return None
     _prune_cache()
     return out
+
+
+_prewarm_q = queue.Queue()
+_prewarm_pending = set()
+_prewarm_lock = threading.Lock()
+
+
+def _prewarm_worker():
+    while True:
+        aid, path = _prewarm_q.get()
+        try:
+            preview_jpeg(aid, path, PREVIEW_MAX)
+        except Exception:
+            pass                      # the request path will try again and report
+        with _prewarm_lock:
+            _prewarm_pending.discard(aid)
+
+
+def prewarm(aid, path):
+    """Queue a background preview conversion for an attachment, once."""
+    with _prewarm_lock:
+        if aid in _prewarm_pending:
+            return
+        _prewarm_pending.add(aid)
+    _prewarm_q.put((aid, path))
+
+
+for _ in range(2):
+    threading.Thread(target=_prewarm_worker, daemon=True).start()
 
 
 def attachment_blob(aid, preview=False):
@@ -879,6 +932,69 @@ def mark_unread(guid):
     return True
 
 
+# ------------------------------------------------------------------- LAN mode
+
+_net_lock = threading.Lock()
+_net = {"at": 0.0, "public": frozenset(), "lan": None, "funnel": None}
+CGNAT = ipaddress.ip_network("100.64.0.0/10")    # Tailscale's own addresses
+_handoffs = {}
+_handoff_lock = threading.Lock()
+
+
+def tailscale_self():
+    """This Mac's public IPs, LAN IP and Funnel URL, as Tailscale sees them.
+
+    `Self.Addrs` holds the WireGuard endpoints Tailscale discovered: the public
+    one is our NAT's address (no third-party "what's my IP" call), and the
+    private one is the LAN interface. Asking the routing table instead gives
+    the 100.x tunnel address whenever Tailscale owns the default route. Cached.
+    """
+    with _net_lock:
+        if time.time() - _net["at"] < NET_TTL:
+            return _net
+        try:
+            out = subprocess.run(
+                [TAILSCALE, "status", "--json"],
+                capture_output=True, timeout=5,
+            ).stdout
+            me = json.loads(out or b"{}").get("Self") or {}
+        except (OSError, ValueError, subprocess.SubprocessError):
+            me = {}
+        public, lan = set(), None
+        for addr in me.get("Addrs") or []:
+            try:
+                ip = ipaddress.ip_address(addr.rpartition(":")[0].strip("[]"))
+            except ValueError:
+                continue
+            if ip.is_global:
+                public.add(str(ip))
+            elif (lan is None and ip.version == 4 and ip.is_private
+                  and ip not in CGNAT):
+                lan = str(ip)
+        dns = (me.get("DNSName") or "").rstrip(".")
+        _net.update(at=time.time(), public=frozenset(public), lan=lan,
+                    funnel="https://" + dns if dns else None)
+        return _net
+
+
+def new_handoff():
+    """One-time code the LAN origin trades for a cookie, so the token itself
+    never rides in a plain-http URL."""
+    now = time.time()
+    code = secrets.token_urlsafe(18)
+    with _handoff_lock:
+        for k in [k for k, exp in _handoffs.items() if exp < now]:
+            del _handoffs[k]
+        _handoffs[code] = now + HANDOFF_TTL
+    return code
+
+
+def take_handoff(code):
+    with _handoff_lock:
+        exp = _handoffs.pop(code, 0)
+    return exp > time.time()
+
+
 # ------------------------------------------------------------------------ server
 
 class Handler(BaseHTTPRequestHandler):
@@ -906,10 +1022,16 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps(body).encode()
         elif isinstance(body, str):
             body = body.encode()
+        extra = dict(extra or {})
+        # Over Funnel bytes are what cost; JSON and the page shrink ~5x.
+        if (len(body) > 1024 and ctype.startswith(GZIP_TYPES)
+                and "gzip" in (self.headers.get("Accept-Encoding") or "")):
+            body = gzip.compress(body, 6)
+            extra["Content-Encoding"] = "gzip"
+            extra["Vary"] = "Accept-Encoding"
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        extra = extra or {}
         if "Cache-Control" not in extra:
             self.send_header("Cache-Control", "no-store")
         for k, v in extra.items():
@@ -926,6 +1048,41 @@ class Handler(BaseHTTPRequestHandler):
         if (query.get("t") or [None])[0] == TOKEN:
             return True, {"Set-Cookie": COOKIE % TOKEN}
         return False, None
+
+    def _route(self):
+        """How this request reached us: funnel, lan, tailnet or local, plus
+        the client's real address."""
+        ip = self.client_address[0]
+        # Only tailscaled, on loopback, is trusted to say a request came via
+        # Funnel; the last X-Forwarded-For hop is the one it added.
+        if ip in ("127.0.0.1", "::1") and self.headers.get("Tailscale-Funnel-Request"):
+            fwd = (self.headers.get("X-Forwarded-For") or "").split(",")[-1].strip()
+            return "funnel", fwd
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return "lan", ip
+        if addr.is_loopback:
+            return "local", ip
+        if addr in CGNAT:
+            return "tailnet", ip
+        return "lan", ip
+
+    def _net_info(self):
+        via, client = self._route()
+        net = tailscale_self()
+        lan = net["lan"]
+        same_lan = via == "funnel" and bool(lan) and client in net["public"]
+        info = {
+            "via": via,
+            "same_lan": same_lan,
+            "lan": "http://%s:%d" % (lan, PORT) if lan else None,
+            "funnel": net["funnel"],
+            "instance": INSTANCE,
+        }
+        if same_lan and TOKEN:
+            info["handoff"] = new_handoff()
+        return info
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -952,6 +1109,20 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/manifest.webmanifest":
             return self._send(200, MANIFEST, "application/manifest+json",
                               ICON_CACHE_HDR)
+        if url.path == "/ping":
+            # Reachability probe for switching between LAN and Funnel; the
+            # other origin calls it, hence CORS. Says nothing but which process.
+            return self._send(200, {"instance": INSTANCE}, extra={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Private-Network": "true",
+            })
+        handoff = (q.get("h") or [""])[0]
+        if url.path == "/" and handoff and TOKEN:
+            if not take_handoff(handoff):
+                return self._send(401, "Link expired\n", "text/plain")
+            # Drop the code from the address bar; the cookie carries on.
+            return self._send(302, "", "text/plain",
+                              {"Location": "/", "Set-Cookie": COOKIE % TOKEN})
 
         ok, cookie = self._authorized(q)
         if not ok:
@@ -986,6 +1157,8 @@ class Handler(BaseHTTPRequestHandler):
                     },
                     extra=cookie,
                 )
+            if url.path == "/api/net":
+                return self._send(200, self._net_info(), extra=cookie)
             if url.path == "/api/poll":
                 return self._send(200, {"max": max_rowid()}, extra=cookie)
             if url.path == "/api/attachment":
@@ -1264,7 +1437,7 @@ PAGE = r"""<!doctype html>
     -webkit-font-smoothing: antialiased;
   }
   #side {
-    width: 300px; flex: 0 0 300px; border-right: 1px solid var(--line);
+    flex: 0 0 var(--side-w, 300px); min-width: 0;
     background: var(--bg-side); display: flex; flex-direction: column;
   }
   #side h1 {
@@ -1278,6 +1451,12 @@ PAGE = r"""<!doctype html>
     font-size: 12px; font-weight: 600; cursor: pointer; padding: 0;
     text-transform: none; letter-spacing: 0;
   }
+  #net {
+    border: 0; background: none; font: inherit; font-size: 11px; cursor: pointer;
+    padding: 0 0 0 8px; text-transform: none; letter-spacing: 0; color: var(--dim);
+  }
+  #net.lan { color: #2fa84f; }
+  #net.offer { color: var(--accent); font-weight: 600; }
   #to {
     margin: 0 12px 10px; padding: 7px 10px; border: 1px solid var(--accent);
     border-radius: 8px; background: var(--bg); color: var(--fg); font: inherit;
@@ -1313,6 +1492,12 @@ PAGE = r"""<!doctype html>
     font-size: 11px; font-weight: 600;
   }
   .chat.sel .badge { background: #fff; color: var(--accent); }
+  #split {
+    flex: 0 0 5px; margin: 0 -2px; z-index: 1; cursor: col-resize; touch-action: none;
+    background: linear-gradient(to right, transparent 2px, var(--line) 2px, var(--line) 3px, transparent 3px);
+  }
+  #split:hover, #split.drag { background: var(--accent); opacity: .6; }
+  body.resizing { cursor: col-resize; user-select: none; -webkit-user-select: none; }
   #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   #head {
     padding: calc(12px + env(safe-area-inset-top)) 18px 12px; border-bottom: 1px solid var(--line); font-weight: 600;
@@ -1353,17 +1538,18 @@ PAGE = r"""<!doctype html>
   #err { color: var(--err); padding: 0 18px 10px; font-size: 12px; white-space: pre-wrap; }
   .empty { color: var(--dim); margin: auto; }
   @media (max-width: 720px) {
-    #side { width: 44vw; flex-basis: 44vw; }
+    #side { flex-basis: var(--side-w, 44vw); }
     .row { max-width: 85%; }
   }
 </style>
 </head><body>
 <aside id="side">
-  <h1>Messages <button id="new">+ New</button></h1>
+  <h1><span>Messages<button id="net" style="display:none"></button></span><button id="new">+ New</button></h1>
   <input id="to" placeholder="Phone numbers or emails, comma-separated" autocomplete="off">
   <input id="search" placeholder="Filter conversations" autocomplete="off">
   <div id="chats"></div>
 </aside>
+<div id="split" title="Drag to resize, double-click to reset"></div>
 <section id="main">
   <div id="head">
     <span id="title">Pick a conversation</span>
@@ -1379,6 +1565,36 @@ PAGE = r"""<!doctype html>
 </section>
 <script>
 const $ = s => document.querySelector(s);
+// Sidebar width: dragged via #split, remembered per browser. Storage can throw
+// (private mode, blocked site data), and the layout must work without it.
+(() => {
+  const split = $("#split"), root = document.documentElement;
+  const clamp = w => Math.round(Math.max(160, Math.min(w, innerWidth - 280)));
+  const apply = w => root.style.setProperty("--side-w", clamp(w) + "px");
+  let saved = null;
+  try { saved = parseInt(localStorage.getItem("sideW"), 10); } catch (e) {}
+  if (saved > 0) apply(saved);
+  split.addEventListener("pointerdown", e => {
+    e.preventDefault();
+    split.setPointerCapture(e.pointerId);
+    split.classList.add("drag"); document.body.classList.add("resizing");
+  });
+  split.addEventListener("pointermove", e => {
+    if (split.classList.contains("drag")) apply(e.clientX);
+  });
+  const end = e => {
+    if (!split.classList.contains("drag")) return;
+    split.classList.remove("drag"); document.body.classList.remove("resizing");
+    const w = parseInt(root.style.getPropertyValue("--side-w"), 10);
+    try { localStorage.setItem("sideW", w); } catch (e) {}
+  };
+  split.addEventListener("pointerup", end);
+  split.addEventListener("pointercancel", end);
+  split.addEventListener("dblclick", () => {
+    root.style.removeProperty("--side-w");
+    try { localStorage.removeItem("sideW"); } catch (e) {}
+  });
+})();
 let chats = [], cur = null, lastId = 0, maxSeen = 0, filter = "", composing = false;
 
 const fmtWhen = ts => {
@@ -1475,6 +1691,10 @@ function drawMessages(msgs, append) {
         wrap.target = "_blank";
         const img = document.createElement("img");
         img.loading = "lazy";
+        img.decoding = "async";
+        // Images arrive after the thread is scrolled to the bottom and push it
+        // up; keep it pinned unless the reader has scrolled away.
+        img.onload = () => { if (pinned) box.scrollTop = box.scrollHeight; };
         img.src = "/api/attachment?id=" + a.id;
         img.alt = a.name;
         // Over Funnel a request can be dropped before it reaches the server;
@@ -1531,8 +1751,13 @@ function drawMessages(msgs, append) {
   }
   lastTs = prev;
   box.scrollTop = box.scrollHeight;
+  pinned = true;
 }
-let lastTs = 0;
+let lastTs = 0, pinned = true;
+$("#thread").addEventListener("scroll", e => {
+  const b = e.target;
+  pinned = b.scrollHeight - b.scrollTop - b.clientHeight < 40;
+});
 
 async function markUnread(guid) {
   await api("/api/unread", {
@@ -1599,13 +1824,47 @@ async function open(c) {
   $("#text").disabled = false;
   $("#send").disabled = false;
   drawChats();
-  const { messages } = await api("/api/messages?chat=" + encodeURIComponent(c.guid));
-  drawMessages(messages, false);
-  if (messages.length) {
-    lastId = messages[messages.length - 1].id;
-    markSeen();
-  }
+  // A cached copy draws at once; the fetch below still runs, since sends can
+  // fail, messages get edited or unsent, and the cache may be behind.
+  const cached = threads.get(c.guid);
+  if (cached) showThread(c, cached.messages);
   $("#text").focus();
+  const messages = await loadThread(c.guid);
+  if (cur !== c || composing) return;           // switched away meanwhile
+  if (!cached || cached.json !== threads.get(c.guid).json) showThread(c, messages);
+}
+function showThread(c, messages) {
+  drawMessages(messages, false);
+  lastId = messages.length ? messages[messages.length - 1].id : 0;
+  if (lastId) markSeen();
+}
+// guid -> {messages, json}. Memory only: nothing about the threads is left on
+// the disk of whatever machine the browser runs on.
+const threads = new Map();
+async function loadThread(guid) {
+  const { messages } = await api("/api/messages?chat=" + encodeURIComponent(guid));
+  threads.set(guid, {messages, json: JSON.stringify(messages)});
+  return messages;
+}
+// Fetch the top threads in the background so opening one doesn't wait on a
+// round trip (most of a second over Funnel). Only threads that changed since
+// they were cached; on the LAN their images are warmed too, which is free.
+let prefetching = false;
+async function prefetch() {
+  if (prefetching) return;
+  prefetching = true;
+  try {
+    for (const c of chats.slice(0, 8)) {
+      const t = threads.get(c.guid);
+      const have = t && t.messages.length ? t.messages[t.messages.length - 1].id : 0;
+      if (have >= c.last_id || (cur && cur.guid === c.guid)) continue;
+      const msgs = await loadThread(c.guid).catch(() => null);
+      if (msgs && net.fast) {
+        for (const m of msgs.slice(-15)) for (const a of m.attachments)
+          if (a.image && a.available) new Image().src = "/api/attachment?id=" + a.id;
+      }
+    }
+  } finally { prefetching = false; }
 }
 
 function markSeen() {
@@ -1637,10 +1896,89 @@ async function tick() {
         drawMessages(messages, true);
         lastId = messages[messages.length - 1].id;
         markSeen();
+        const t = threads.get(cur.guid);
+        if (t) {
+          t.messages = t.messages.concat(messages).slice(-300);
+          t.json = JSON.stringify(t.messages);
+        }
       }
     }
     await refreshChats();
-  } catch (e) { /* transient; next tick retries */ }
+    prefetch();
+  } catch (e) {
+    failures++;
+    if (failures >= 3 && net.via === "lan") fallBackToFunnel();
+    return;
+  }
+  failures = 0;
+}
+
+// ---- LAN mode. Through Funnel every request goes out to Tailscale's relay
+// and back even when this browser is in the same house. The server says when
+// our public IPs match; then the page checks the LAN address answers (with the
+// same server instance) and moves there, carrying a one-time login code.
+let net = {}, failures = 0;
+const standalone = matchMedia("(display-mode: standalone)").matches;
+function prefersFunnel() {
+  try { return localStorage.getItem("imsg-net") === "funnel"; } catch (e) { return false; }
+}
+async function reachable(base, instance) {
+  try {
+    const ctl = new AbortController();
+    setTimeout(() => ctl.abort(), 2500);
+    // targetAddressSpace lets Chrome reach a private http address from this
+    // https page (asking once for local-network permission); browsers without
+    // it refuse as mixed content, and the link is still there to click.
+    const r = await fetch(base + "/ping", {signal: ctl.signal, targetAddressSpace: "local"});
+    return r.ok && (await r.json()).instance === instance;
+  } catch (e) { return false; }
+}
+async function goLan() {
+  const r = await api("/api/net");          // a fresh one-time code
+  location.href = r.lan + "/" + (r.handoff ? "?h=" + encodeURIComponent(r.handoff) : "");
+}
+async function fallBackToFunnel() {
+  if (!net.funnel || fallBackToFunnel.busy) return;
+  fallBackToFunnel.busy = true;
+  try {
+    const r = await fetch(net.funnel + "/ping").catch(() => null);
+    // Only leave if Funnel answers: if both fail the server is just restarting.
+    if (r && r.ok) location.href = net.funnel + "/";
+  } finally { fallBackToFunnel.busy = false; }
+}
+function drawNet() {
+  const b = $("#net");
+  b.style.display = "none";
+  b.className = "";
+  if (net.via === "lan" && net.funnel) {
+    b.textContent = "· LAN";
+    b.className = "lan";
+    b.title = "Connected directly over the home network. Click to use the internet address instead.";
+    b.onclick = () => { location.href = net.funnel + "/?net=funnel"; };
+    b.style.display = "";
+  } else if (net.same_lan && !standalone) {
+    b.textContent = "· use LAN";
+    b.className = "offer";
+    b.title = "You're on the same network as the Mac: connect to it directly, skipping the internet round trip.";
+    b.onclick = () => {
+      try { localStorage.removeItem("imsg-net"); } catch (e) {}
+      goLan();
+    };
+    b.style.display = "";
+  }
+}
+async function checkNet() {
+  if (new URLSearchParams(location.search).get("net") === "funnel") {
+    try { localStorage.setItem("imsg-net", "funnel"); } catch (e) {}
+    history.replaceState(null, "", "/");
+  }
+  try { net = await api("/api/net"); } catch (e) { return; }
+  net.fast = net.via === "lan" || net.via === "local";
+  drawNet();
+  if (net.same_lan && net.lan && !standalone && !prefersFunnel()
+      && await reachable(net.lan, net.instance)) {
+    location.href = net.lan + "/" + (net.handoff ? "?h=" + encodeURIComponent(net.handoff) : "");
+  }
 }
 
 async function send() {
@@ -1714,7 +2052,8 @@ $("#text").addEventListener("input", e => {
 });
 $("#search").addEventListener("input", e => { filter = e.target.value; drawChats(); });
 
-refreshChats().then(() => api("/api/poll")).then(r => { maxSeen = r.max; });
+checkNet();
+refreshChats().then(() => api("/api/poll")).then(r => { maxSeen = r.max; prefetch(); });
 setInterval(tick, 3000);
 </script>
 </body></html>
