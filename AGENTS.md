@@ -260,8 +260,18 @@ back for every request. So the page moves itself onto the LAN when it can:
   http address in Chrome, via `fetch(..., {targetAddressSpace: "local"})`
   (Local Network Access; prompts once). Safari/iOS block it as mixed content,
   so the probe fails quietly and the header shows a **"use LAN"** link instead.
-  Installed (standalone) apps are never switched — leaving the origin would
-  pop them out of the app.
+  Installed apps on phones/tablets (`pinnedApp`) are never switched — leaving
+  the origin pops iOS out of the app. A desktop Chrome app window switches
+  fine (it just shows an address strip), so those are not excluded.
+- **The work Mac can't use LAN mode, and that's not a bug.** Its Chrome sends
+  everything, private addresses included, through Google's corporate proxy
+  (UberProxy/BeyondCorp), which errors on `10.0.0.89`. Its public IP still
+  matches ours (`same_lan=True` in the log), so detection alone can't tell. If
+  the local-network permission is granted and the probe fails anyway, the
+  page hides "use LAN" (`net.unreachable`). Don't try to route around the
+  proxy; Funnel is the path that machine is allowed.
+- Every `/api/net` call logs `net: via=… client=… ours=… same_lan=…` — the
+  first thing to read when LAN mode doesn't kick in.
 - On the LAN origin, three failed polls make the page check Funnel's `/ping`
   and move back there — only if Funnel answers, so a server restart doesn't
   bounce it. Clicking "· LAN" goes back to Funnel and sets

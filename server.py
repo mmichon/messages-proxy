@@ -1082,6 +1082,10 @@ class Handler(BaseHTTPRequestHandler):
         }
         if same_lan and TOKEN:
             info["handoff"] = new_handoff()
+        # Once per page load; this is the line to read when LAN mode doesn't kick in.
+        self.log_message("net: via=%s client=%s ours=%s lan=%s same_lan=%s",
+                         via, client, ",".join(sorted(net["public"])) or "?",
+                         lan, same_lan)
         return info
 
     def _body(self):
@@ -1918,7 +1922,12 @@ async function tick() {
 // our public IPs match; then the page checks the LAN address answers (with the
 // same server instance) and moves there, carrying a one-time login code.
 let net = {}, failures = 0;
-const standalone = matchMedia("(display-mode: standalone)").matches;
+// An installed app on a phone or tablet would be thrown out of the app (iOS
+// opens a Safari sheet) by moving to another origin; a desktop Chrome app
+// window just shows the new address in a strip and carries on.
+const pinnedApp = matchMedia("(display-mode: standalone)").matches && (
+  /iPhone|iPad|iPod|Android/.test(navigator.userAgent)
+  || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
 function prefersFunnel() {
   try { return localStorage.getItem("imsg-net") === "funnel"; } catch (e) { return false; }
 }
@@ -1956,7 +1965,7 @@ function drawNet() {
     b.title = "Connected directly over the home network. Click to use the internet address instead.";
     b.onclick = () => { location.href = net.funnel + "/?net=funnel"; };
     b.style.display = "";
-  } else if (net.same_lan && !standalone) {
+  } else if (net.same_lan && !pinnedApp && !net.unreachable) {
     b.textContent = "· use LAN";
     b.className = "offer";
     b.title = "You're on the same network as the Mac: connect to it directly, skipping the internet round trip.";
@@ -1975,10 +1984,20 @@ async function checkNet() {
   try { net = await api("/api/net"); } catch (e) { return; }
   net.fast = net.via === "lan" || net.via === "local";
   drawNet();
-  if (net.same_lan && net.lan && !standalone && !prefersFunnel()
-      && await reachable(net.lan, net.instance)) {
-    location.href = net.lan + "/" + (net.handoff ? "?h=" + encodeURIComponent(net.handoff) : "");
+  if (!net.same_lan || !net.lan || pinnedApp) return;
+  if (await reachable(net.lan, net.instance)) {
+    if (!prefersFunnel())
+      location.href = net.lan + "/" + (net.handoff ? "?h=" + encodeURIComponent(net.handoff) : "");
+    return;
   }
+  // With local-network access granted, a failed probe means the LAN really
+  // can't be reached from this browser -- a work Chrome sends even private
+  // addresses through the corporate proxy, which errors -- so don't offer a
+  // link that leads there. Safari can't probe at all and keeps the link.
+  try {
+    const p = await navigator.permissions.query({name: "local-network-access"});
+    if (p.state === "granted") { net.unreachable = true; drawNet(); }
+  } catch (e) { /* no such permission in this browser */ }
 }
 
 async function send() {
