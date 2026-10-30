@@ -3,3 +3,4 @@ __pycache__/
 messages-proxy.log
 messages-proxy.pid
 token
+cache/

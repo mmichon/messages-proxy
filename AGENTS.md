@@ -16,8 +16,11 @@ Messages.app (a locked-down work machine) can still use iMessage in a browser.
 
 - **Never write to `chat.db`.** It's opened `mode=ro` and unread state lives in
   `state.db` instead of touching Apple's `is_read` column.
-- Attachment paths from the DB are realpath'd and must resolve inside
-  `~/Library/Messages/Attachments`, else the request 404s.
+- Attachment paths from the DB are realpath'd by `attachment_path()` and must
+  resolve inside `~/Library/Messages/Attachments` **or**
+  `~/Library/Messages/StickerCache`, else the request 404s. Use that one helper
+  everywhere: the listing's `available` flag and `/api/attachment` disagreeing is
+  exactly how stickers ended up as "unavailable" notes.
 - `.pluginPayloadAttachment` rows are link previews/app payloads, not files — skipped.
 
 ## chat.db notes (verified on macOS 27.2)
@@ -32,6 +35,35 @@ Messages.app (a locked-down work machine) can still use iMessage in a browser.
   UTF-8 payload after the `NSString` marker, with a printable-run fallback.
 - AppleScript `send ... to chat id` works here, but `service type of account` raises
   -10000 — don't rely on account properties.
+
+## Images and attachments
+
+`/api/attachment?id=<rowid>` serves a **browser-safe JPEG**; `&full=1` is the same
+image at original resolution. Nothing is ever handed to the browser that Chrome
+can't decode, because it couldn't: ~60% of incoming images are `image/heic`
+(iPhone photos, ~4 MB each), which **only Safari renders**. In Chrome the `<img>`
+fired `onerror` and the UI drew its "📎 name — unavailable" note instead — the
+"images arrive as text attachment mentions" symptom, which never showed up
+locally because Safari was fine.
+
+- Conversion is `/usr/bin/sips` (no deps, and the cron-spawned server can run it
+  with no extra TCC grant). `-Z` **upscales** smaller images, so `preview_jpeg()`
+  checks `image_size()` first and passes it only when the source is bigger.
+- Converted files are cached in `cache/` (gitignored), keyed by rowid + source
+  mtime + size + cap, pruned oldest-first past 300 MB. A ~4 MB HEIC takes ~0.25s
+  once, then ~1ms — worth having, since every open tab re-fetches on poll.
+- Inline previews cap the longest edge at `PREVIEW_MAX` (1600): 3.6 MB → ~700 KB,
+  which matters over Funnel. Clicking the image opens `&full=1`.
+- GIFs are never converted (sips would flatten the animation), and formats the
+  browser already handles are only shrunk if they're over `PREVIEW_MIN_BYTES`
+  and the JPEG actually comes out smaller. HEIC/TIFF are converted regardless.
+- **Headers are latin-1.** macOS screenshot names carry U+202F before AM/PM, so
+  `Content-Disposition: filename="…"` raised `UnicodeEncodeError` and 500'd the
+  request — another image that arrived as a text mention. `content_disposition()`
+  sends an ASCII-folded name plus RFC 6266 `filename*=UTF-8''…`.
+- Still open: a message whose only attachment is a `.pluginPayloadAttachment`
+  (link previews, including iCloud photo-share links) has nothing to draw and
+  falls back to "📎 attachment unavailable".
 
 ## Running
 

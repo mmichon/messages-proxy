@@ -21,25 +21,43 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 HOME = os.path.expanduser("~")
 CHAT_DB = os.path.join(HOME, "Library", "Messages", "chat.db")
-ATTACH_ROOT = os.path.join(HOME, "Library", "Messages", "Attachments")
+# Stickers don't live under Attachments/, so both roots are allowed; a path
+# from chat.db that resolves outside them is refused.
+ATTACH_ROOTS = (
+    os.path.join(HOME, "Library", "Messages", "Attachments"),
+    os.path.join(HOME, "Library", "Messages", "StickerCache"),
+)
 ADDRESSBOOK_GLOB = os.path.join(
     HOME, "Library", "Application Support", "AddressBook", "Sources",
     "*", "AddressBook-v22.abcddb",
 )
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_DB = os.path.join(APP_DIR, "state.db")
+CACHE_DIR = os.path.join(APP_DIR, "cache")
 SEND_SCRIPT = os.path.join(APP_DIR, "send.applescript")
 NEW_SCRIPT = os.path.join(APP_DIR, "new.applescript")
+_REAL_ROOTS = tuple(os.path.realpath(r) for r in ATTACH_ROOTS)
 
 APPLE_EPOCH = 978307200  # 2001-01-01 UTC, in Unix seconds
 
 PORT = int(os.environ.get("IMSG_PORT", "8787"))
 BIND = os.environ.get("IMSG_BIND", "0.0.0.0")
 TOKEN = os.environ.get("IMSG_TOKEN") or None
+
+# Inline images are transcoded to JPEG and capped at this longest edge. Phone
+# photos arrive as ~4 MB HEIC, which no browser but Safari can decode at all.
+PREVIEW_MAX = 1600
+PREVIEW_MIN_BYTES = 512 * 1024   # below this, serve the original untouched
+# Chrome and Firefox decode none of these; Safari only handles HEIC.
+TRANSCODE_MIMES = (
+    "image/heic", "image/heif", "image/heic-sequence", "image/heif-sequence",
+    "image/tiff", "image/x-adobe-dng",
+)
+CACHE_MAX_BYTES = 300 * 1024 * 1024
 
 # ---------------------------------------------------------------- chat.db access
 
@@ -70,12 +88,26 @@ def _snapshot_path():
         return os.path.join(d, "chat.db")
 
 
+def _drop_snapshot():
+    """Delete the snapshot once the live DB is readable again — it's a full copy."""
+    if not _snap["dir"]:
+        return
+    with _snap_lock:
+        # Wait a minute past the last refresh so a reader that just got the
+        # snapshot path from another thread isn't pulled out from under.
+        if _snap["dir"] and time.time() - _snap["at"] > 60:
+            shutil.rmtree(_snap["dir"], ignore_errors=True)
+            _snap["dir"] = None
+            _snap["at"] = 0.0
+
+
 def chat_db():
     """Read-only connection to chat.db, falling back to a snapshot copy."""
     try:
         con = sqlite3.connect("file:%s?mode=ro" % CHAT_DB, uri=True, timeout=5)
         con.row_factory = sqlite3.Row
         con.execute("select 1 from message limit 1").fetchone()
+        _drop_snapshot()
         return con
     except sqlite3.Error:
         con = sqlite3.connect("file:%s?mode=ro" % _snapshot_path(), uri=True, timeout=5)
@@ -386,7 +418,7 @@ def attachments_for(con, message_ids):
             continue  # link previews and app payloads, not real files
         mime = r["mime_type"] or mimetypes.guess_type(name)[0] or ""
         # Attachments can be iCloud-offloaded or purged; the row outlives the file.
-        local = r["filename"] and os.path.isfile(os.path.expanduser(r["filename"]))
+        local = attachment_path(r["filename"])
         out.setdefault(r["mid"], []).append(
             {
                 "id": r["aid"],
@@ -442,7 +474,113 @@ def max_rowid():
         con.close()
 
 
-def attachment_blob(aid):
+def attachment_path(filename):
+    """Realpath of an attachment file, or None if it is gone or out of bounds.
+
+    The one place the roots are enforced, so the listing's "available" flag and
+    /api/attachment can't disagree -- they used to, for stickers: the flag said
+    yes and the fetch 404'd, which the UI then drew as a text mention.
+    """
+    if not filename:
+        return None
+    path = os.path.realpath(os.path.expanduser(filename))
+    for root in _REAL_ROOTS:
+        if path.startswith(root + os.sep) and os.path.isfile(path):
+            return path
+    return None
+
+
+def wants_preview(mime, nbytes):
+    """Whether a big-but-displayable image is worth shrinking for the inline view."""
+    if mime == "image/gif":
+        return False                 # sips would flatten it to one frame
+    return mime.startswith("image/") and nbytes > PREVIEW_MIN_BYTES
+
+
+def _prune_cache():
+    """Keep the preview cache under CACHE_MAX_BYTES, oldest-first."""
+    try:
+        files = []
+        for n in os.listdir(CACHE_DIR):
+            f = os.path.join(CACHE_DIR, n)
+            try:
+                st = os.stat(f)
+            except OSError:
+                continue
+            files.append((st.st_mtime, st.st_size, f))
+    except OSError:
+        return
+    total = sum(f[1] for f in files)
+    for _, size, f in sorted(files):
+        if total <= CACHE_MAX_BYTES:
+            return
+        try:
+            os.remove(f)
+            total -= size
+        except OSError:
+            pass
+
+
+def image_size(path):
+    """(width, height) from sips, or (0, 0) if it won't say."""
+    try:
+        out = subprocess.run(
+            ["/usr/bin/sips", "-g", "pixelWidth", "-g", "pixelHeight", path],
+            capture_output=True, text=True, timeout=20,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return (0, 0)
+    dims = {}
+    for line in out.splitlines():
+        k, _, v = line.strip().partition(": ")
+        if k in ("pixelWidth", "pixelHeight") and v.isdigit():
+            dims[k] = int(v)
+    return (dims.get("pixelWidth", 0), dims.get("pixelHeight", 0))
+
+
+def preview_jpeg(aid, path, cap=PREVIEW_MAX):
+    """A browser-safe JPEG of `path`, converted by sips on first request.
+
+    `cap` is the longest edge in pixels, or 0 to keep the original size.
+
+    Returns the cached file's path, or None if conversion failed (the caller
+    then falls back to the original bytes). Keyed by rowid plus the source's
+    mtime and size, so each attachment is converted once, not on every poll.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    out = os.path.join(
+        CACHE_DIR, "%d-%d-%d-%d.jpg" % (aid, int(st.st_mtime), st.st_size, cap))
+    if os.path.isfile(out) and os.path.getsize(out):
+        os.utime(out, None)          # keep hot previews out of the prune
+        return out
+    # Thread id in the temp name: two tabs can ask for the same image at once.
+    tmp = "%s.%d.tmp" % (out, threading.get_ident())
+    args = ["-s", "format", "jpeg", "-s", "formatOptions", "72"]
+    if cap and max(image_size(path)) > cap:
+        args += ["-Z", str(cap)]           # -Z would otherwise upscale small ones
+    try:
+        if not os.path.isdir(CACHE_DIR):
+            os.makedirs(CACHE_DIR, 0o700)
+        subprocess.run(
+            ["/usr/bin/sips"] + args + [path, "--out", tmp],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=60, check=True,
+        )
+        os.replace(tmp, out)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return None
+    _prune_cache()
+    return out
+
+
+def attachment_blob(aid, preview=False):
     con = chat_db()
     try:
         row = con.execute(
@@ -451,16 +589,39 @@ def attachment_blob(aid):
         ).fetchone()
     finally:
         con.close()
-    if not row or not row["filename"]:
+    if not row:
         return None
-    path = os.path.realpath(os.path.expanduser(row["filename"]))
-    root = os.path.realpath(ATTACH_ROOT)
-    if not path.startswith(root + os.sep) or not os.path.isfile(path):
+    path = attachment_path(row["filename"])
+    if not path:
         return None
     name = row["transfer_name"] or os.path.basename(path)
     mime = row["mime_type"] or mimetypes.guess_type(name)[0] or "application/octet-stream"
+    # A HEIC is converted either way -- at full size for the click-through,
+    # since no browser but Safari can open the original at all. Formats that do
+    # display get shrunk for the inline view only.
+    forced = mime in TRANSCODE_MIMES
+    if forced or (preview and wants_preview(mime, os.path.getsize(path))):
+        jpg = preview_jpeg(aid, path, PREVIEW_MAX if preview else 0)
+        # A JPEG of an already-displayable image can come out bigger than the
+        # original; those fall back to the file as it is.
+        if jpg and (forced or os.path.getsize(jpg) < os.path.getsize(path)):
+            with open(jpg, "rb") as fh:
+                return "image/jpeg", os.path.splitext(name)[0] + ".jpg", fh.read()
     with open(path, "rb") as fh:
         return mime, name, fh.read()
+
+
+def content_disposition(name):
+    """RFC 6266 filename, ASCII plus a UTF-8 copy for everything else.
+
+    Headers go out latin-1 encoded, so a macOS screenshot name -- they carry
+    U+202F before AM/PM -- used to raise UnicodeEncodeError and 500 the request,
+    which the UI then showed as a text mention instead of the image.
+    """
+    ascii_name = re.sub(r"[^\x20-\x7e]", "_", name).replace('"', "")
+    return "inline; filename=\"%s\"; filename*=UTF-8''%s" % (
+        ascii_name, quote(name, safe=""),
+    )
 
 
 # --------------------------------------------------------------------- sending
@@ -721,13 +882,14 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/poll":
                 return self._send(200, {"max": max_rowid()}, extra=cookie)
             if url.path == "/api/attachment":
-                got = attachment_blob(int((q.get("id") or [0])[0]))
+                full = (q.get("full") or ["0"])[0] == "1"
+                got = attachment_blob(int((q.get("id") or [0])[0]), preview=not full)
                 if not got:
                     return self._send(404, "not found\n", "text/plain")
                 mime, name, data = got
                 return self._send(
                     200, data, mime,
-                    {"Content-Disposition": 'inline; filename="%s"' % name.replace('"', "")},
+                    {"Content-Disposition": content_disposition(name)},
                 )
             return self._send(404, {"error": "not found"})
         except Exception as exc:  # keep the server up; surface the cause
@@ -1047,6 +1209,10 @@ function drawMessages(msgs, append) {
         note.textContent = "\u{1F4CE} " + (a.name || "attachment") + " — not downloaded to this Mac";
         bub.append(note);
       } else if (a.image) {
+        // The <img> gets the downscaled JPEG; the link has the original file.
+        const wrap = document.createElement("a");
+        wrap.href = "/api/attachment?id=" + a.id + "&full=1";
+        wrap.target = "_blank";
         const img = document.createElement("img");
         img.loading = "lazy";
         img.src = "/api/attachment?id=" + a.id;
@@ -1055,9 +1221,10 @@ function drawMessages(msgs, append) {
           const n = document.createElement("div");
           n.className = "note";
           n.textContent = "\u{1F4CE} " + (a.name || "image") + " — unavailable";
-          img.replaceWith(n);
+          wrap.replaceWith(n);
         };
-        bub.append(img);
+        wrap.append(img);
+        bub.append(wrap);
       } else {
         const link = document.createElement("a");
         link.href = "/api/attachment?id=" + a.id;
