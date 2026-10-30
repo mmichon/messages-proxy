@@ -202,10 +202,20 @@ those, people you've actually messaged before the rest of Contacts ("kan" → th
 Kanter you text, not Kangaroo Babysitting); mid-word substring hits always below
 every prefix hit (else "ann" puts Joanna above Ann).
 
-The field still holds comma-separated handles — picking a suggestion swaps the
-term after the last comma for the person's handle, and the `#sub` line shows the
-resolved names. A typed name that was never picked is refused twice: the client
-won't send it, and `parse_handles(…, rejects)` makes `/api/new` 400 on it.
+Picked people are **chips showing names**; `recips` holds `{name, handle}` and the
+input after the chips holds only the term being typed. A typed number or email
+becomes a chip on comma (handled in `input`, not `keydown` — phone keyboards
+report "Unidentified" keys), Enter, or send, and is renamed once `/api/match`
+knows the contact. Backspace on an empty input or a chip's × removes one.
+
+**Enter opens an existing thread.** With recipients chosen, Enter calls
+`/api/match`; if those people already share a thread it `open()`s it, exactly as
+picking it from the sidebar would, so you continue there instead of a blank
+compose. `chatFor()` builds a stand-in chat object when the thread is older than
+the 120 the sidebar loaded. No match moves focus to the message box.
+
+A typed name that was never picked is refused twice: the client won't send it,
+and `parse_handles(…, rejects)` makes `/api/new` 400 on it.
 Before that, `parse_handles` silently dropped non-handles, so "Matt, +1415…"
 would have quietly gone out as a 1:1 to the other person.
 

@@ -1586,10 +1586,24 @@ PAGE = r"""<!doctype html>
   }
   #net.lan { color: #2fa84f; }
   #net.offer { color: var(--accent); font-weight: 600; }
+  #tobox {
+    margin: 0 12px 10px; padding: 4px 6px; border: 1px solid var(--accent);
+    border-radius: 8px; background: var(--bg); display: none;
+    flex-wrap: wrap; gap: 4px; align-items: center; cursor: text;
+  }
   #to {
-    margin: 0 12px 10px; padding: 7px 10px; border: 1px solid var(--accent);
-    border-radius: 8px; background: var(--bg); color: var(--fg); font: inherit;
-    display: none;
+    flex: 1 1 80px; min-width: 80px; padding: 3px 4px; border: none;
+    background: none; color: var(--fg); font: inherit; outline: none;
+  }
+  .chip {
+    display: inline-flex; align-items: center; gap: 2px; max-width: 100%;
+    padding: 2px 4px 2px 9px; border-radius: 12px;
+    background: var(--accent); color: #fff; font-size: 13px;
+  }
+  .chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chip button {
+    border: none; background: none; color: inherit; opacity: .8;
+    font: inherit; font-size: 15px; line-height: 1; padding: 0 4px; cursor: pointer;
   }
   #suggest {
     margin: -6px 12px 10px; border: 1px solid var(--line); border-radius: 8px;
@@ -1688,7 +1702,7 @@ PAGE = r"""<!doctype html>
 </head><body>
 <aside id="side">
   <h1><span>Messages<button id="net" style="display:none"></button></span><button id="new">+ New</button></h1>
-  <input id="to" placeholder="Name, number, or email" autocomplete="off">
+  <div id="tobox"><input id="to" placeholder="Name, number, or email" autocomplete="off"></div>
   <div id="suggest"></div>
   <input id="search" placeholder="Filter conversations" autocomplete="off">
   <div id="chats"></div>
@@ -1761,10 +1775,6 @@ async function api(path, opts) {
     throw err;
   }
   return body;
-}
-
-function splitHandles(value) {
-  return (value || "").split(",").map(s => s.trim()).filter(Boolean);
 }
 
 function drawChats() {
@@ -1919,7 +1929,7 @@ function closeThread() {
   lastId = 0;
   lastTs = 0;
   composing = false;
-  $("#to").style.display = "none";
+  $("#tobox").style.display = "none";
   hideSuggest();
   $("#title").textContent = "Pick a conversation";
   $("#sub").textContent = "";
@@ -1938,8 +1948,10 @@ function startCompose() {
   cur = null;
   composing = true;
   lastId = 0;
-  $("#to").style.display = "block";
+  $("#tobox").style.display = "flex";
   $("#to").value = "";
+  recips = [];
+  drawChips();
   $("#title").textContent = "New message";
   $("#sub").textContent = "";
   $("#markunread").style.display = "none";
@@ -1960,7 +1972,7 @@ async function open(c) {
   composing = false;
   lastId = 0;
   lastTs = 0;
-  $("#to").style.display = "none";
+  $("#tobox").style.display = "none";
   hideSuggest();
   $("#markunread").style.display = "";
   $("#title").textContent = c.name;
@@ -2145,14 +2157,17 @@ async function checkNet() {
 async function send() {
   const text = $("#text").value;
   if (!text.trim()) return;
-  const handles = composing ? splitHandles($("#to").value) : [];
-  if (composing && !handles.length) { $("#to").focus(); return; }
-  const unpicked = handles.filter(t => !isHandle(t));
-  if (unpicked.length) {
-    $("#err").textContent = "Pick " + unpicked.join(", ") + " from the suggestions first.";
-    $("#to").focus();
-    return;
+  if (composing) {
+    commitTerm();
+    const unpicked = currentTerm();
+    if (unpicked) {
+      $("#err").textContent = "Pick " + unpicked + " from the suggestions first.";
+      $("#to").focus();
+      return;
+    }
   }
+  const handles = composing ? recips.map(r => r.handle) : [];
+  if (composing && !handles.length) { $("#to").focus(); return; }
   if (!composing && !cur) return;
   $("#send").disabled = true;
   $("#err").textContent = "";
@@ -2166,8 +2181,8 @@ async function send() {
       $("#text").value = "";
       $("#text").style.height = "auto";
       await refreshChats();
-      const c = chats.find(x => x.guid === r.chat);
-      if (c) await open(c); else composing = false;
+      if (r.chat) await open(chatFor(r.chat, recips.map(p => p.name), handles));
+      else composing = false;
     } else {
       await api("/api/send", {
         method: "POST",
@@ -2191,9 +2206,10 @@ async function send() {
 $("#send").onclick = send;
 $("#new").onclick = startCompose;
 $("#markunread").onclick = () => { if (cur) markUnread(cur.guid); };
-// -- recipient autocomplete. The field holds comma-separated handles; whatever
-// follows the last comma is the term being typed, and picking a suggestion
-// swaps that term for the person's handle.
+// -- recipients. Picked people are chips showing their name (the handle rides
+// along for sending); the input after the chips holds only the term being
+// typed, which drives the suggestions.
+let recips = [];   // [{name, handle}]
 let suggestions = [], suggestOn = -1, suggestTimer = null, suggestFor = "";
 
 function isHandle(t) {
@@ -2201,8 +2217,81 @@ function isHandle(t) {
 }
 
 function currentTerm() {
-  const v = $("#to").value;
-  return v.slice(v.lastIndexOf(",") + 1).trim();
+  return $("#to").value.trim();
+}
+
+// Mirrors the server's handle_key(), so a number typed two ways is one chip.
+function sameHandle(a, b) {
+  const key = h => h.includes("@") ? h.trim().toLowerCase() : h.replace(/\D/g, "").slice(-10);
+  return key(a) === key(b);
+}
+
+function addRecip(name, handle) {
+  if (!recips.some(r => sameHandle(r.handle, handle))) recips.push({name, handle});
+  drawChips();
+  resolveRecipients();
+}
+
+function removeRecip(i) {
+  recips.splice(i, 1);
+  drawChips();
+  resolveRecipients();
+}
+
+function drawChips() {
+  const box = $("#tobox");
+  box.querySelectorAll(".chip").forEach(el => el.remove());
+  recips.forEach((r, i) => {
+    const chip = document.createElement("span");
+    chip.className = "chip";
+    chip.title = r.handle;
+    const label = document.createElement("span");
+    label.textContent = r.name;
+    const x = document.createElement("button");
+    x.type = "button";
+    x.textContent = "×";
+    x.setAttribute("aria-label", "Remove " + r.name);
+    // pointerdown so the input keeps focus (and the keyboard stays up on a phone).
+    x.addEventListener("pointerdown", ev => {
+      ev.preventDefault(); removeRecip(i); $("#to").focus();
+    });
+    chip.append(label, x);
+    box.insertBefore(chip, $("#to"));
+  });
+  $("#to").placeholder = recips.length ? "Add someone" : "Name, number, or email";
+}
+
+// A typed number or email becomes a chip on comma, Enter, or send.
+function commitTerm() {
+  const t = currentTerm();
+  if (t && isHandle(t)) { $("#to").value = ""; addRecip(t, t); }
+}
+
+// The sidebar's copy of a chat when it has one; otherwise enough for open() —
+// the matching thread can be older than the chats the sidebar loaded.
+function chatFor(guid, names, handles) {
+  return chats.find(x => x.guid === guid) || {
+    guid, name: names.join(", "), names, handles, service: "",
+  };
+}
+
+// Enter with people chosen: if they already share a thread, continue it there,
+// exactly as if it had been picked from the sidebar; otherwise go write.
+async function openOrCompose() {
+  commitTerm();
+  const left = currentTerm();
+  if (left) {
+    $("#err").textContent = "No contact matches “" + left + "”.";
+    return;
+  }
+  if (!recips.length) return;
+  const handles = recips.map(r => r.handle);
+  try {
+    const r = await fetchMatch(handles);
+    if (!composing) return;                       // moved on meanwhile
+    if (r.found) return open(chatFor(r.chat, r.names, handles));
+  } catch (e) { /* can't tell; composing a new message is the safe fallback */ }
+  $("#text").focus();
 }
 
 function hideSuggest() {
@@ -2232,33 +2321,59 @@ function drawSuggest() {
 function pickSuggest(i) {
   const c = suggestions[i];
   if (!c) return;
-  const v = $("#to").value;
-  $("#to").value = v.slice(0, v.lastIndexOf(",") + 1).replace(/,$/, ", ").trimStart() + c.handle + ", ";
+  $("#to").value = "";
   hideSuggest();
+  addRecip(c.name, c.handle);
   $("#to").focus();
-  resolveRecipients();
 }
 
-// Say who the message will reach, and whether that thread exists: a group that
-// doesn't exist can't be created from here, so say so before anything's written.
-let matchTimer = null;
+function fetchMatch(handles) {
+  return api("/api/match?handles=" + encodeURIComponent(handles.join(",")));
+}
+
+// Say whether these people already share a thread: Enter will open it, and a
+// group that doesn't exist can't be created from here, so say so up front.
+let matchTimer = null, matchSeq = 0;
 function resolveRecipients() {
   clearTimeout(matchTimer);
-  const handles = splitHandles($("#to").value).filter(isHandle);
+  const handles = recips.map(r => r.handle);
   if (!handles.length) { $("#sub").textContent = ""; return; }
+  const seq = ++matchSeq;
   matchTimer = setTimeout(async () => {
     try {
-      const r = await api("/api/match?handles=" + encodeURIComponent(handles.join(",")));
-      const who = r.names.join(", ");
-      $("#sub").textContent = r.found ? "→ " + who
-        : handles.length === 1 ? "new conversation with " + who
+      const r = await fetchMatch(handles);
+      if (seq !== matchSeq || !composing) return;   // recipients changed meanwhile
+      // A typed-in number shows as itself until the server names it.
+      if (r.names.length === recips.length) {
+        let renamed = false;
+        recips.forEach((p, i) => {
+          if (p.name === p.handle && r.names[i] !== p.handle) { p.name = r.names[i]; renamed = true; }
+        });
+        if (renamed) drawChips();
+      }
+      $("#sub").textContent = r.found ? "existing thread — press Enter to open it"
+        : handles.length === 1 ? "new conversation"
         : "no existing group with these " + handles.length + " people";
     } catch (e) { $("#sub").textContent = ""; }
   }, 250);
 }
 
+$("#tobox").addEventListener("click", () => $("#to").focus());
 $("#to").addEventListener("input", () => {
-  resolveRecipients();
+  // Commas finish entries — this also catches phone keyboards, whose keydown
+  // events often say "Unidentified". Numbers and emails become chips; a name
+  // stays as the term so its suggestions come up.
+  const v = $("#to").value;
+  if (v.includes(",")) {
+    const parts = v.split(",");
+    const rest = parts.pop().trimStart();
+    const keep = [];
+    parts.map(p => p.trim()).filter(Boolean).forEach(p => {
+      if (isHandle(p)) addRecip(p, p); else keep.push(p);
+    });
+    $("#to").value = keep.concat(rest ? [rest] : []).join(", ");
+  }
+  $("#err").textContent = "";
   clearTimeout(suggestTimer);
   const term = currentTerm();
   if (!term || isHandle(term)) { hideSuggest(); return; }
@@ -2286,7 +2401,11 @@ $("#to").addEventListener("keydown", e => {
     }
     if (e.key === "Escape") return hideSuggest();
   }
-  if (e.key === "Enter") { e.preventDefault(); $("#text").focus(); }
+  if (e.key === "Backspace" && !$("#to").value && recips.length) {
+    e.preventDefault();
+    return removeRecip(recips.length - 1);
+  }
+  if (e.key === "Enter") { e.preventDefault(); openOrCompose(); }
 });
 $("#to").addEventListener("blur", () => setTimeout(hideSuggest, 150));
 $("#text").addEventListener("keydown", e => {
