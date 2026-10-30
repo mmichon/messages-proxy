@@ -155,6 +155,18 @@ def _phone_key(value):
     return digits[-10:] if len(digits) >= 10 else digits
 
 
+def handle_key(handle):
+    """Comparison key for a handle: lowercased for emails, last 10 digits for phones.
+
+    Everything that matches handles against each other goes through this, so 1:1
+    lookups and group participant-set matching can't drift apart.
+    """
+    handle = (handle or "").strip()
+    if not handle:
+        return ""
+    return handle.lower() if "@" in handle else _phone_key(handle)
+
+
 def _contact_label(first, last, org, nick):
     name = " ".join(p for p in (first, last) if p).strip()
     return name or nick or org or ""
@@ -212,9 +224,7 @@ def pretty_handle(handle):
     if not handle:
         return ""
     names = contact_map()
-    if "@" in handle:
-        return names.get(handle.strip().lower(), handle)
-    return names.get(_phone_key(handle), handle)
+    return names.get(handle_key(handle), handle)
 
 
 def apple_ts(value):
@@ -458,8 +468,10 @@ def attachment_blob(aid):
 def send_message(guid, text):
     """Try the chat's own GUID, then per-service variants of its handle."""
     candidates = [guid]
-    if ";" in guid:
-        handle = guid.rsplit(";", 1)[-1]
+    handle = guid.rsplit(";", 1)[-1]
+    # A group's tail is `chat<hex>`, not a handle — per-service variants of it are
+    # meaningless and would only bury the real error.
+    if ";" in guid and not handle.startswith("chat"):
         kind = ";-;" if ";-;" in guid else ";+;"
         for svc in ("iMessage", "SMS", "any"):
             alt = svc + kind + handle
@@ -526,6 +538,65 @@ def find_chat_for_handle(handle):
         return None
     for r in rows:
         if _phone_key(r["chat_identifier"] or "") == want:
+            return r["guid"]
+    return None
+
+
+def parse_handles(value):
+    """Accept a list or a comma-separated string; trim, drop blanks, de-dupe."""
+    if isinstance(value, str):
+        value = value.split(",")
+    out, seen = [], set()
+    for item in value or []:
+        item = (item or "").strip()
+        key = handle_key(item)
+        if not item or not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+NO_GROUP_ERROR = (
+    "No existing group thread with exactly those people. macOS won't let a "
+    "script create a group chat (the Messages AppleScript suite has only "
+    "send/login/logout), so start the group once from Messages.app or your "
+    "iPhone and it'll work here from then on."
+)
+
+
+def find_chat_for_handles(handles):
+    """Newest chat whose participant set is *exactly* these handles.
+
+    Equality, not containment: a message addressed to three people must never
+    land in a four-person thread that happens to include them.
+    """
+    want = set(k for k in (handle_key(h) for h in handles) if k)
+    if not want:
+        return None
+
+    # Left join the messages: most group rows in chat.db are message-less shells
+    # (7496 chats here, 246 with any history), and the thread you want may well
+    # be one of them. Ordering puts chats with real history first.
+    con = chat_db()
+    try:
+        rows = con.execute(
+            "select c.guid, max(cmj.message_id) as mid, "
+            "  group_concat(distinct h.id) as parts "
+            "from chat c "
+            "join chat_handle_join chj on chj.chat_id = c.ROWID "
+            "join handle h on h.ROWID = chj.handle_id "
+            "left join chat_message_join cmj on cmj.chat_id = c.ROWID "
+            "group by c.ROWID order by mid is null, mid desc"
+        ).fetchall()
+    finally:
+        con.close()
+
+    for r in rows:
+        parts = set(
+            k for k in (handle_key(p) for p in (r["parts"] or "").split(",")) if k
+        )
+        if parts == want:
             return r["guid"]
     return None
 
@@ -631,6 +702,22 @@ class Handler(BaseHTTPRequestHandler):
                 if msgs is None:
                     return self._send(404, {"error": "no such chat"})
                 return self._send(200, {"messages": msgs}, extra=cookie)
+            if url.path == "/api/match":
+                handles = parse_handles((q.get("handles") or [""])[0])
+                guid = (
+                    find_chat_for_handles(handles) if len(handles) > 1
+                    else find_chat_for_handle(handles[0]) if handles
+                    else None
+                )
+                return self._send(
+                    200,
+                    {
+                        "found": bool(guid),
+                        "chat": guid,
+                        "names": [pretty_handle(h) for h in handles],
+                    },
+                    extra=cookie,
+                )
             if url.path == "/api/poll":
                 return self._send(200, {"max": max_rowid()}, extra=cookie)
             if url.path == "/api/attachment":
@@ -667,10 +754,21 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, {"ok": True, "via": info}, extra=cookie)
                 return self._send(502, {"ok": False, "error": info})
             if url.path == "/api/new":
-                handle = (body.get("handle") or "").strip()
+                handles = parse_handles(
+                    body.get("handles") or body.get("handle") or ""
+                )
                 text = body.get("text") or ""
-                if not handle or not text.strip():
+                if not handles or not text.strip():
                     return self._send(400, {"error": "handle and text required"})
+                if len(handles) > 1:
+                    guid = find_chat_for_handles(handles)
+                    if not guid:
+                        return self._send(409, {"ok": False, "error": NO_GROUP_ERROR})
+                    sent, info = send_message(guid, text)
+                    if not sent:
+                        return self._send(502, {"ok": False, "error": info})
+                    return self._send(200, {"ok": True, "chat": guid}, extra=cookie)
+                handle = handles[0]
                 existing = find_chat_for_handle(handle)
                 if existing:
                     # Already have a thread with them; use the normal path.
@@ -840,7 +938,7 @@ PAGE = r"""<!doctype html>
 </head><body>
 <aside id="side">
   <h1>Messages <button id="new">+ New</button></h1>
-  <input id="to" placeholder="Phone number or email, then type below" autocomplete="off">
+  <input id="to" placeholder="Phone numbers or emails, comma-separated" autocomplete="off">
   <input id="search" placeholder="Filter conversations" autocomplete="off">
   <div id="chats"></div>
 </aside>
@@ -875,8 +973,16 @@ const fmtFull = ts => ts ? new Date(ts * 1000).toLocaleString([], {
 async function api(path, opts) {
   const r = await fetch(path, opts);
   const body = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(body.error || r.status);
+  if (!r.ok) {
+    const err = new Error(body.error || r.status);
+    err.status = r.status;
+    throw err;
+  }
   return body;
+}
+
+function splitHandles(value) {
+  return (value || "").split(",").map(s => s.trim()).filter(Boolean);
 }
 
 function drawChats() {
@@ -1028,7 +1134,7 @@ function startCompose() {
   $("#thread").textContent = "";
   const e = document.createElement("div");
   e.className = "empty";
-  e.textContent = "Enter a phone number or email above";
+  e.textContent = "Enter one or more recipients above, comma-separated";
   $("#thread").append(e);
   $("#text").disabled = false;
   $("#send").disabled = false;
@@ -1097,8 +1203,8 @@ async function tick() {
 async function send() {
   const text = $("#text").value;
   if (!text.trim()) return;
-  const handle = composing ? $("#to").value.trim() : null;
-  if (composing && !handle) { $("#to").focus(); return; }
+  const handles = composing ? splitHandles($("#to").value) : [];
+  if (composing && !handles.length) { $("#to").focus(); return; }
   if (!composing && !cur) return;
   $("#send").disabled = true;
   $("#err").textContent = "";
@@ -1107,7 +1213,7 @@ async function send() {
       const r = await api("/api/new", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({handle, text}),
+        body: JSON.stringify({handles, text}),
       });
       $("#text").value = "";
       $("#text").style.height = "auto";
@@ -1125,7 +1231,9 @@ async function send() {
       setTimeout(tick, 900);
     }
   } catch (e) {
-    $("#err").textContent = "Send failed — " + e.message;
+    // 409 is the "no such group thread" explanation; it speaks for itself.
+    $("#err").textContent =
+      e.status === 409 ? e.message : "Send failed — " + e.message;
   } finally {
     $("#send").disabled = false;
     $("#text").focus();
@@ -1137,6 +1245,22 @@ $("#new").onclick = startCompose;
 $("#markunread").onclick = () => { if (cur) markUnread(cur.guid); };
 $("#to").addEventListener("keydown", e => {
   if (e.key === "Enter") { e.preventDefault(); $("#text").focus(); }
+});
+// Resolve recipients while they're typed: a group that doesn't exist can't be
+// created from here, so say so before a message gets written.
+let matchTimer = null;
+$("#to").addEventListener("input", () => {
+  clearTimeout(matchTimer);
+  const handles = splitHandles($("#to").value);
+  if (handles.length < 2) { $("#sub").textContent = ""; return; }
+  matchTimer = setTimeout(async () => {
+    try {
+      const r = await api("/api/match?handles=" + encodeURIComponent(handles.join(",")));
+      $("#sub").textContent = r.found
+        ? "→ " + r.names.join(", ")
+        : "no existing group with these " + handles.length + " people";
+    } catch (e) { $("#sub").textContent = ""; }
+  }, 250);
 });
 $("#text").addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }

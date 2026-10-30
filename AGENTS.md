@@ -69,6 +69,41 @@ finds an existing thread instead of starting a duplicate.
 Note `service type of account` raises -10000 when read directly, but the
 `whose service type = iMessage` filter works — don't "simplify" it into a property read.
 
+**Multiple recipients** (`POST /api/new {handles: [...], text}`; `handle` still
+accepted, and a comma-separated string works for either). A **new group thread
+cannot be created from a script on this macOS** — don't go looking for a way.
+`sdef /System/Applications/Messages.app` has one suite with exactly three
+commands: `send`, `login`, `logout`. There is no Standard Suite, so no `make`,
+and the usual `make new text chat with properties {participants:…}` recipe is
+dead. The `chat` class's "may be specified at time of creation" note is
+vestigial. Creating one would mean UI-scripting Messages.app, which needs an
+Accessibility TCC grant for `/usr/sbin/cron` and steals focus — deliberately not
+done.
+
+So multi-recipient sends only reach groups that **already exist**:
+`find_chat_for_handles()` compares `handle_key()` sets for **exact equality**
+(not containment — a message for three people must never land in a four-person
+thread) and sends to the match through the normal `chat id` path. No match is a
+**409** carrying `NO_GROUP_ERROR`, which the UI prints as-is. `GET
+/api/match?handles=…` resolves recipients while they're typed so the compose box
+can say up front whether a thread exists.
+
+Two traps that cost real debugging here:
+
+- **Most chat rows have no messages** — 7496 chats, 246 with any history. Group
+  shells in particular. So `find_chat_for_handles()` **left** joins
+  `chat_message_join` and orders `mid is null, mid desc`; an inner join (what
+  `list_chats` and `find_chat_for_handle` use) silently misses most groups.
+- **Duplicate shells are normal**: several chat rows can carry the identical
+  participant set. The ordering makes the pick deterministic — the one with the
+  most recent message wins.
+
+`handle_key()` is the single normalization used by matching *and* `pretty_handle`;
+keep it that way so 1:1 and group matching can't drift. Group GUIDs are
+`…;+;chat<hex>`, so `send_message()` skips its per-service variant expansion when
+the tail starts with `chat` — those variants are meaningless for a group and only
+bury the real error.
+
 **Mark unread** (`POST /api/unread`) rewinds this app's `seen` marker to one below
 the chat's last incoming rowid. It is **web-UI only** — chat.db is never written, so
 Messages.app on this Mac and your iPhone keep their own read state and will not show
