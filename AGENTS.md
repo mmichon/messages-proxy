@@ -52,6 +52,22 @@ Persistence is a **cron** entry running `keepalive.sh` every minute:
 
     * * * * * $HOME/src/imsg-web/keepalive.sh
 
+## Remote access (Tailscale Funnel)
+
+Reachable from anywhere at **https://macbook-air.tail823fbf.ts.net** — nothing is
+installed on the client, it's an ordinary https page. Config:
+
+    /Applications/Tailscale.app/Contents/MacOS/Tailscale funnel --bg 8787
+    # off:  ... funnel --https=443 off
+
+Notes:
+- Use the CLI **inside the app bundle**. Tailscale here is the GUI app running as
+  IPNExtension, so `/opt/homebrew/bin/tailscale` can't find its socket.
+- Funnel needs `--shields-up=false`; it was on and had to be turned off. That also
+  lets other tailnet devices reach this Mac's ports, so don't re-enable blindly.
+- Funnel required a one-time enable on the tailnet in the admin console.
+- First visit needs `?t=<token>`; after that an HttpOnly cookie carries it.
+
 ## Permissions — why cron and not launchd
 
 The process needs two TCC grants: **Full Disk Access** (read chat.db) and
