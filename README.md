@@ -1,8 +1,9 @@
 # messages-proxy
 
-Read and send iMessage/SMS from any browser, through a Mac that is signed in to Messages.app.
-Built for the case where the machine in front of you (a locked-down work laptop) can't run
-Messages.app, but you still want your conversations on it.
+A web-based iMessage/SMS frontend you can run locally or proxy over the network. A Mac that is
+signed in to Messages.app does the real work; any browser can then read and send through it.
+Useful when the computer in front of you can't run Messages: a locked-down work machine, Windows,
+Linux, a Chromebook, or anything else with a browser.
 
 ![messages-proxy web UI](docs/screenshot.png)
 
