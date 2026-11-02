@@ -54,6 +54,15 @@ STATE_DB = os.path.join(APP_DIR, "state.db")
 CACHE_DIR = os.path.join(APP_DIR, "cache")
 SEND_SCRIPT = os.path.join(APP_DIR, "send.applescript")
 NEW_SCRIPT = os.path.join(APP_DIR, "new.applescript")
+SENDFILE_SCRIPT = os.path.join(APP_DIR, "sendfile.applescript")
+# Files uploaded to be sent. Messages is sandboxed and only reliably picks up
+# attachments from user folders like ~/Pictures; a file sent from $TMPDIR or the
+# app dir goes out as "Not Delivered". Messages copies the file into its own
+# Attachments folder asynchronously, so staged files are kept for a while
+# rather than deleted right after the send.
+UPLOAD_DIR = os.path.join(HOME, "Pictures", "messages-proxy")
+UPLOAD_MAX_BYTES = 100 * 1024 * 1024
+UPLOAD_KEEP_SECONDS = 3600
 _REAL_ROOTS = tuple(os.path.realpath(r) for r in ATTACH_ROOTS)
 
 APPLE_EPOCH = 978307200  # 2001-01-01 UTC, in Unix seconds
@@ -71,6 +80,10 @@ ICON_CACHE_HDR = {"Cache-Control": "public, max-age=604800"}
 # photos arrive as ~4 MB HEIC, which no browser but Safari can decode at all.
 PREVIEW_MAX = 1200                # bubbles are <=68% wide; 2x DPR covers it
 ATTACH_CACHE = "private, max-age=31536000, immutable"
+# How long an outgoing row with is_sent = 0 and no error counts as still in
+# flight. Settled rows in chat.db are never in that state.
+SENDING_WINDOW = 600
+
 CLIENT_GONE = (BrokenPipeError, ConnectionResetError)
 PREVIEW_MIN_BYTES = 512 * 1024   # below this, serve the original untouched
 # Chrome and Firefox decode none of these; Safari only handles HEIC.
@@ -463,6 +476,50 @@ def search_contacts(query, limit=8):
     ]
 
 
+def search_groups(query, limit=5):
+    """Named group threads whose name contains `query`, newest activity first.
+
+    Only chats with a display_name (~7% of groups): the rest are labeled from
+    their participants and are found by typing those people instead. Sidebar
+    search only sees the 120 newest chats; this reaches older ones too.
+    """
+    q = (query or "").strip().lower()
+    if len(q) < 2:
+        return []
+    con = chat_db()
+    try:
+        rows = con.execute(
+            "select c.ROWID as cid, c.guid, c.display_name, c.service_name, "
+            "  (select max(message_id) from chat_message_join where chat_id = c.ROWID) as mid "
+            "from chat c where c.display_name != '' and lower(c.display_name) like ? "
+            "order by mid is null, mid desc",
+            ("%" + q.replace("%", "").replace("_", "") + "%",),
+        ).fetchall()
+        seen, picked = set(), []
+        for r in rows:
+            # Duplicate shells share a name; the newest one is the live thread.
+            if r["display_name"].lower() in seen or r["mid"] is None:
+                continue
+            seen.add(r["display_name"].lower())
+            picked.append(r)
+            if len(picked) >= limit:
+                break
+        parts = chat_participants(con, [r["cid"] for r in picked])
+    finally:
+        con.close()
+    out = []
+    for r in picked:
+        handles = parts.get(r["cid"], [])
+        out.append({
+            "name": r["display_name"],
+            "guid": r["guid"],
+            "service": r["service_name"],
+            "handles": handles,
+            "names": [pretty_handle(h) for h in handles],
+        })
+    return out
+
+
 def apple_ts(value):
     """chat.db dates are nanoseconds since the Apple epoch (older rows: seconds)."""
     if not value:
@@ -494,7 +551,7 @@ limit ?
 MESSAGES_SQL = """
 select m.ROWID as mid, m.guid, m.text, m.attributedBody, m.is_from_me, m.date,
        m.service, m.is_sent, m.error, m.item_type, m.associated_message_type,
-       m.cache_has_attachments, m.date_edited, m.date_retracted, h.id as sender
+       m.associated_message_guid, m.associated_message_emoji, m.cache_has_attachments, m.date_edited, m.date_retracted, h.id as sender
 from chat_message_join cmj
 join message m on m.ROWID = cmj.message_id
 left join handle h on h.ROWID = m.handle_id
@@ -658,6 +715,27 @@ def attachments_for(con, message_ids):
     return out
 
 
+# Tapbacks are messages of their own: associated_message_type 2000+n adds
+# reaction n to the message named by associated_message_guid, 3000+n takes it
+# back. n=6 is a free-form emoji (associated_message_emoji); n=7, a sticker
+# placed on a bubble, carries an attachment and is left to draw as one.
+TAPBACKS = ["\u2764\ufe0f", "\U0001f44d", "\U0001f44e", "\U0001f602", "\u203c\ufe0f", "\u2753"]
+
+
+def reaction_of(row):
+    kind = row["associated_message_type"] or 0
+    if not (2000 <= kind <= 2006 or 3000 <= kind <= 3006):
+        return None
+    n = kind % 1000
+    emoji = row["associated_message_emoji"] if n == 6 else TAPBACKS[n]
+    target = row["associated_message_guid"] or ""
+    # "p:0/<guid>" names part 0 of a message; older rows use "bp:<guid>".
+    target = target.split("/", 1)[1] if "/" in target else target.split(":", 1)[-1]
+    if not target or (kind < 3000 and not emoji):
+        return None
+    return {"to": target, "emoji": emoji or "", "add": kind < 3000}
+
+
 def list_messages(guid, after=0, limit=200):
     con = chat_db()
     try:
@@ -671,18 +749,27 @@ def list_messages(guid, after=0, limit=200):
         con.close()
 
     out = []
+    now = time.time()
     for r in rows:
+        # is_sent stays 0 while Messages is still handing the message off;
+        # only an error code means it failed. A row stuck unsent long past
+        # that window with no error never went out either.
+        unsent = bool(r["is_from_me"]) and not r["is_sent"] and not r["error"]
+        sending = unsent and now - apple_ts(r["date"]) < SENDING_WINDOW
         out.append(
             {
                 "id": r["mid"],
+                "guid": r["guid"],
                 "text": msg_text(r),
                 "from_me": bool(r["is_from_me"]),
                 "sender": pretty_handle(r["sender"]),
                 "ts": apple_ts(r["date"]),
                 "service": r["service"] or "",
-                "failed": bool(r["error"]) or (bool(r["is_from_me"]) and not r["is_sent"]),
+                "sending": sending,
+                "failed": bool(r["error"]) or (unsent and not sending),
                 "system": bool(r["item_type"]),
                 "tapback": bool(r["associated_message_type"]),
+                "react": reaction_of(r),
                 "edited": bool(r["date_edited"]),
                 "unsent": bool(r["date_retracted"]),
                 "attachments": atts.get(r["mid"], []),
@@ -881,8 +968,11 @@ def content_disposition(name):
 
 # --------------------------------------------------------------------- sending
 
-def send_message(guid, text):
-    """Try the chat's own GUID, then per-service variants of its handle."""
+def send_message(guid, text, script=SEND_SCRIPT):
+    """Try the chat's own GUID, then per-service variants of its handle.
+
+    With `script=SENDFILE_SCRIPT`, `text` is the path of a file to send.
+    """
     candidates = [guid]
     handle = guid.rsplit(";", 1)[-1]
     # A group's tail is `chat<hex>`, not a handle — per-service variants of it are
@@ -897,7 +987,7 @@ def send_message(guid, text):
     errors = []
     for cand in candidates:
         proc = subprocess.run(
-            ["osascript", SEND_SCRIPT, cand, text],
+            ["osascript", script, cand, text],
             capture_output=True,
             text=True,
             timeout=45,
@@ -906,6 +996,35 @@ def send_message(guid, text):
             return True, cand
         errors.append("%s: %s" % (cand, (proc.stderr or "").strip()))
     return False, " | ".join(errors)
+
+
+def stage_upload(name, data):
+    """Write an uploaded file under UPLOAD_DIR, keeping its name (Messages shows
+    it), in a directory of its own so two uploads named image.png can't collide."""
+    _prune_uploads()
+    name = os.path.basename(name or "").strip().lstrip(".") or "attachment"
+    name = re.sub(r"[/\\:\x00-\x1f]", "_", name)[:120]
+    folder = os.path.join(UPLOAD_DIR, secrets.token_hex(8))
+    os.makedirs(folder, mode=0o700)
+    path = os.path.join(folder, name)
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+
+def _prune_uploads():
+    cutoff = time.time() - UPLOAD_KEEP_SECONDS
+    try:
+        entries = os.listdir(UPLOAD_DIR)
+    except FileNotFoundError:
+        return
+    for e in entries:
+        d = os.path.join(UPLOAD_DIR, e)
+        try:
+            if os.path.getmtime(d) < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            pass
 
 
 def start_conversation(handle, text):
@@ -1278,7 +1397,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"messages": msgs}, extra=cookie)
             if url.path == "/api/contacts":
                 term = (q.get("q") or [""])[0]
-                return self._send(200, {"contacts": search_contacts(term)}, extra=cookie)
+                return self._send(
+                    200,
+                    {"contacts": search_contacts(term), "groups": search_groups(term)},
+                    extra=cookie,
+                )
             if url.path == "/api/match":
                 handles = parse_handles((q.get("handles") or [""])[0])
                 guid = (
@@ -1329,6 +1452,22 @@ class Handler(BaseHTTPRequestHandler):
         if not ok:
             return self._send(401, "Unauthorized\n", "text/plain")
         try:
+            if url.path == "/api/sendfile":
+                # Raw bytes in the body (not multipart, not JSON); the chat and
+                # filename ride in the query string.
+                q = parse_qs(url.query)
+                guid = (q.get("chat") or [""])[0].strip()
+                n = int(self.headers.get("Content-Length") or 0)
+                if not guid or not n:
+                    return self._send(400, {"error": "chat and file required"})
+                if n > UPLOAD_MAX_BYTES:
+                    return self._send(413, {"error": "file is over %d MB"
+                                            % (UPLOAD_MAX_BYTES // 2**20)})
+                path = stage_upload((q.get("name") or [""])[0], self.rfile.read(n))
+                sent, info = send_message(guid, path, SENDFILE_SCRIPT)
+                if sent:
+                    return self._send(200, {"ok": True, "via": info}, extra=cookie)
+                return self._send(502, {"ok": False, "error": info})
             body = self._body()
             if url.path == "/api/send":
                 guid = (body.get("chat") or "").strip()
@@ -1686,10 +1825,34 @@ PAGE = r"""<!doctype html>
     white-space: pre-wrap; overflow-wrap: anywhere;
   }
   .row.me .bubble { background: var(--out); color: var(--out-fg); }
+  .bubble { position: relative; }
+  .row.reacted { margin-top: 14px; }
+  .reacts {
+    position: absolute; top: -14px; right: -8px; display: flex; gap: 2px;
+    background: var(--in); border: 2px solid var(--bg); border-radius: 12px;
+    padding: 1px 5px; font-size: 13px; line-height: 18px; white-space: nowrap; cursor: default;
+  }
+  .row.me .reacts { right: auto; left: -8px; }
+  .reacts .n { font-size: 11px; color: var(--dim); }
+  .row:not(.sys) .bubble { cursor: pointer; }
+  .picker {
+    position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 5; display: flex; gap: 2px;
+    background: var(--bg); border: 1px solid var(--line); border-radius: 20px; padding: 3px 5px;
+    box-shadow: 0 4px 14px rgba(0,0,0,.18); white-space: nowrap; cursor: default;
+  }
+  .row.me .picker { left: auto; right: 0; }
+  .picker.below { bottom: auto; top: calc(100% + 6px); }
+  .picker button {
+    font: inherit; font-size: 20px; line-height: 1; background: none; border: 0;
+    padding: 5px; border-radius: 50%; cursor: pointer;
+  }
+  .picker button:hover { background: var(--in); }
+  .picker button:disabled { opacity: .35; cursor: default; }
   .row.sys { align-self: center; max-width: 80%; }
   .row.sys .bubble { background: none; color: var(--dim); font-size: 12px; text-align: center; }
   .meta { font-size: 11px; color: var(--dim); margin: 2px 4px 0; }
   .meta .fail { color: var(--err); font-weight: 600; }
+  .meta .sending { font-style: italic; }
   .bubble img { max-width: 100%; border-radius: 10px; display: block; margin: 4px 0; }
   .note.retry { cursor: pointer; }
   .bubble .note { font-size: 12.5px; opacity: .72; font-style: italic; }
@@ -1708,6 +1871,25 @@ PAGE = r"""<!doctype html>
     padding: 0 18px; font: inherit; font-weight: 600; cursor: pointer;
   }
   #send:disabled { opacity: .45; cursor: default; }
+  #attach {
+    border: 0; background: none; color: var(--dim); font-size: 22px; line-height: 1;
+    padding: 0 2px; cursor: pointer; align-self: center;
+  }
+  #attach:disabled { opacity: .35; cursor: default; }
+  #tray { display: flex; gap: 8px; flex-wrap: wrap; padding: 0 12px; }
+  #tray:empty { display: none; }
+  #tray .pend { position: relative; margin-top: 10px; }
+  #tray img, #tray .file {
+    height: 64px; max-width: 120px; border-radius: 8px; border: 1px solid var(--line);
+    object-fit: cover; display: block;
+  }
+  #tray .file { padding: 6px 8px; font-size: 12px; color: var(--dim); overflow: hidden; }
+  #tray .pend button {
+    position: absolute; top: -7px; right: -7px; width: 20px; height: 20px;
+    border-radius: 50%; border: 0; background: var(--fg); color: var(--bg);
+    font-size: 13px; line-height: 20px; padding: 0; cursor: pointer;
+  }
+  #main.drop { outline: 2px dashed var(--accent); outline-offset: -6px; }
   #err { color: var(--err); padding: 0 18px 10px; font-size: 12px; white-space: pre-wrap; }
   .empty { color: var(--dim); margin: auto; }
   @media (max-width: 720px) {
@@ -1732,7 +1914,10 @@ PAGE = r"""<!doctype html>
   </div>
   <div id="thread"><div class="empty">Nothing selected</div></div>
   <div id="err"></div>
+  <div id="tray"></div>
   <div id="composer">
+    <button id="attach" title="Attach a photo or file (or paste / drop one)" disabled>📎</button>
+    <input id="file" type="file" multiple hidden>
     <textarea id="text" rows="1" placeholder="Message" disabled></textarea>
     <button id="send" disabled>Send</button>
   </div>
@@ -1839,14 +2024,25 @@ function drawMessages(msgs, append) {
     box.append(e);
     return;
   }
+  if (!append) {
+    reacts.clear();
+    byText.clear();
+    lastImage = lastAttachment = null;
+  }
   let prev = append ? lastTs : 0;
   for (const m of msgs) {
+    // A tapback is drawn on the bubble it reacts to, not as a row of its own.
+    // Reactions to messages older than the loaded window are dropped.
+    if (m.react) { addReact(m); continue; }
+    const fb = fallbackReact(m);
+    if (fb) { addReact({...m, react: fb}); continue; }
     const row = document.createElement("div");
     row.className = "row" + (m.from_me ? " me" : "") + (m.system ? " sys" : "");
     if (prev && m.ts - prev > 3600) row.classList.add("gap");
     prev = m.ts;
     const bub = document.createElement("div");
     bub.className = "bubble";
+    if (m.guid) bub.dataset.guid = m.guid;
     if (m.text) bub.append(document.createTextNode(m.text));
     for (const a of m.attachments) {
       if (!a.available) {
@@ -1902,6 +2098,10 @@ function drawMessages(msgs, append) {
       bub.append(Object.assign(document.createElement("div"),
         {className: "note", textContent: "\u{1F4CE} attachment unavailable"}));
     }
+    if (!m.system && !m.unsent) bub.addEventListener("click", e => {
+      if (e.target.closest("a, .picker, .note.retry") || String(getSelection())) return;
+      togglePicker(bub, m);
+    });
     row.append(bub);
     const bits = [fmtFull(m.ts)];
     if (!m.from_me && cur && cur.handles.length > 1 && m.sender) bits.unshift(m.sender);
@@ -1910,20 +2110,134 @@ function drawMessages(msgs, append) {
     const meta = document.createElement("div");
     meta.className = "meta";
     meta.textContent = bits.join(" · ");
-    if (m.failed) {
-      const f = document.createElement("span");
-      f.className = "fail";
-      f.textContent = " · not delivered";
-      meta.append(f);
-    }
+    meta.dataset.id = m.id;
+    setStatus(meta, m);
     row.append(meta);
     box.append(row);
+    if (reacts.has(m.guid)) drawReacts(m.guid);
+    if (m.guid && !m.system) {
+      if (m.text) byText.set(m.text, m.guid);
+      if (m.attachments.length) lastAttachment = m.guid;
+      if (m.attachments.some(a => a.image)) lastImage = m.guid;
+    }
   }
   lastTs = prev;
   box.scrollTop = box.scrollHeight;
   pinned = true;
 }
 let lastTs = 0, pinned = true;
+// Reacting from here. Messages has no scripting hook for a real tapback (its
+// dictionary is send/login/logout), so the reaction goes out as an ordinary
+// text in Apple's own fallback wording -- what an iPhone sends to devices that
+// can't show tapbacks, and what Google Messages turns into a reaction. On
+// iMessage it arrives as a new message; this page folds it back into a badge
+// (fallbackReact).
+const REACT_VERBS = [["\u2764\ufe0f", "Loved", "a heart"], ["\u{1F44D}", "Liked", "a like"],
+                     ["\u{1F44E}", "Disliked", "a dislike"], ["\u{1F602}", "Laughed at", "a laugh"],
+                     ["\u203c\ufe0f", "Emphasized", "an exclamation"],
+                     ["\u2753", "Questioned", "a question mark"]];
+function reactText(verb, m) {
+  if (m.text) return verb + " \u201c" + m.text + "\u201d";
+  const a = m.attachments[0];
+  return verb + (a && a.image ? " an image" : " an attachment");
+}
+// A text like Loved \u201c\u2026\u201d / Removed a heart from \u201c\u2026\u201d / Laughed at an image,
+// whether sent from here or by a phone that can't do tapbacks, drawn as a
+// reaction on the message it quotes. Returns null (draw as text) when the
+// wording doesn't match or the quoted message isn't loaded.
+const FALLBACK_RE = new RegExp(
+  "^(?:(" + REACT_VERBS.map(v => v[1]).join("|") + ")|Removed (" +
+  REACT_VERBS.map(v => v[2]).join("|") + ") from) (?:[\u201c\"]([\\s\\S]*)[\u201d\"]|an? (image|attachment))$");
+function fallbackReact(m) {
+  const hit = !m.attachments.length && m.text && FALLBACK_RE.exec(m.text);
+  if (!hit) return null;
+  const v = REACT_VERBS.find(x => x[1] === hit[1] || x[2] === hit[2]);
+  let to = null;
+  if (hit[4]) to = hit[4] === "image" ? lastImage : lastAttachment;
+  else {
+    const q = hit[3];
+    to = byText.get(q) || null;
+    // Some senders cut a long quote short with an ellipsis.
+    const cut = q.replace(/(\u2026|\.\.\.)$/, "");
+    if (!to && cut !== q && cut) {
+      for (const [t, g] of byText) if (t.startsWith(cut)) to = g;
+    }
+  }
+  return to ? {to, emoji: v[0], add: !!hit[1]} : null;
+}
+const byText = new Map();   // message text -> guid of the newest with it
+let lastImage = null, lastAttachment = null;
+function closePicker() {
+  const p = document.querySelector(".picker");
+  if (p) p.remove();
+}
+function togglePicker(bub, m) {
+  const open = bub.querySelector(".picker");
+  closePicker();
+  if (open) return;
+  const p = document.createElement("div");
+  p.className = "picker";
+  for (const [emoji, verb] of REACT_VERBS) {
+    const b = document.createElement("button");
+    b.textContent = emoji;
+    b.title = reactText(verb, m);
+    b.onclick = async () => {
+      if (!cur) return;
+      for (const x of p.querySelectorAll("button")) x.disabled = true;
+      $("#err").textContent = "";
+      try {
+        await api("/api/send", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({chat: cur.guid, text: reactText(verb, m)}),
+        });
+        closePicker();
+        setTimeout(tick, 900);
+      } catch (e) {
+        closePicker();
+        $("#err").textContent = "Reaction failed — " + e.message;
+      }
+    };
+    p.append(b);
+  }
+  bub.append(p);
+  // Near the top of the thread there's no room above; drop it below instead.
+  if (p.getBoundingClientRect().top < $("#thread").getBoundingClientRect().top)
+    p.classList.add("below");
+}
+document.addEventListener("click", e => {
+  if (!e.target.closest(".bubble")) closePicker();
+});
+document.addEventListener("keydown", e => { if (e.key === "Escape") closePicker(); });
+// target message guid -> Map(who -> emoji). One reaction per person per
+// message: a newer one replaces theirs, a removal (3000-range) clears it.
+const reacts = new Map();
+function addReact(m) {
+  const who = m.from_me ? "You" : (m.sender || "?");
+  if (!reacts.has(m.react.to)) reacts.set(m.react.to, new Map());
+  const per = reacts.get(m.react.to);
+  if (m.react.add) per.set(who, m.react.emoji); else per.delete(who);
+  drawReacts(m.react.to);
+}
+function drawReacts(guid) {
+  const bub = document.querySelector('.bubble[data-guid="' + CSS.escape(guid) + '"]');
+  if (!bub) return;
+  const old = bub.querySelector(".reacts");
+  if (old) old.remove();
+  const per = reacts.get(guid);
+  bub.parentNode.classList.toggle("reacted", !!(per && per.size));
+  if (!per || !per.size) return;
+  const counts = new Map();
+  for (const e of per.values()) counts.set(e, (counts.get(e) || 0) + 1);
+  const el = document.createElement("div");
+  el.className = "reacts";
+  el.title = [...per].map(([who, e]) => who + " " + e).join("\n");
+  for (const [e, n] of counts) {
+    el.append(document.createTextNode(e));
+    if (n > 1) el.append(Object.assign(document.createElement("span"), {className: "n", textContent: n}));
+  }
+  bub.append(el);
+}
 $("#thread").addEventListener("scroll", e => {
   const b = e.target;
   pinned = b.scrollHeight - b.scrollTop - b.clientHeight < 40;
@@ -1956,6 +2270,8 @@ function closeThread() {
   e.textContent = "Nothing selected";
   $("#thread").append(e);
   $("#text").disabled = true;
+  $("#attach").disabled = true;
+  clearPending();
   $("#send").disabled = true;
   drawChats();
 }
@@ -1977,6 +2293,8 @@ function startCompose() {
   e.textContent = "Type a name above — add more people for a group";
   $("#thread").append(e);
   $("#text").disabled = false;
+  $("#attach").disabled = false;
+  clearPending();
   $("#send").disabled = false;
   $("#err").textContent = "";
   drawChats();
@@ -1996,6 +2314,8 @@ async function open(c) {
   $("#sub").textContent = [c.service, who].filter(Boolean).join(" · ");
   $("#err").textContent = "";
   $("#text").disabled = false;
+  $("#attach").disabled = false;
+  clearPending();
   $("#send").disabled = false;
   drawChats();
   // A cached copy draws at once; the fetch below still runs, since sends can
@@ -2058,10 +2378,42 @@ async function refreshChats() {
   drawChats();
 }
 
+// The " · sending" / " · not delivered" tail of a message's meta line.
+function setStatus(meta, m) {
+  const old = meta.querySelector(".status");
+  if (old) old.remove();
+  if (!m.sending && !m.failed) return;
+  const f = document.createElement("span");
+  f.className = "status " + (m.failed ? "fail" : "sending");
+  f.textContent = m.failed ? " · not delivered" : " · sending";
+  meta.append(f);
+}
+// A message going out flips is_sent (or gets an error) on its existing row,
+// which doesn't move the max rowid that tick() watches. While the open thread
+// has any, re-read from the oldest one and update their status in place.
+async function recheckSending() {
+  const t = cur && threads.get(cur.guid);
+  const first = t && t.messages.find(m => m.sending);
+  if (!first) return;
+  const guid = cur.guid;
+  const { messages } = await api(
+    "/api/messages?chat=" + encodeURIComponent(guid) + "&after=" + (first.id - 1));
+  if (!cur || cur.guid !== guid) return;
+  const byId = new Map(messages.map(m => [m.id, m]));
+  t.messages = t.messages.map(m => {
+    const n = byId.get(m.id);
+    if (!n || (n.sending === m.sending && n.failed === m.failed)) return m;
+    const meta = $("#thread .meta[data-id='" + m.id + "']");
+    if (meta) setStatus(meta, n);
+    return Object.assign({}, m, {sending: n.sending, failed: n.failed});
+  });
+  t.json = JSON.stringify(t.messages);
+}
+
 async function tick() {
   try {
     const { max } = await api("/api/poll");
-    if (max === maxSeen) return;
+    if (max === maxSeen) return await recheckSending();
     maxSeen = max;
     if (cur && lastId) {
       const { messages } = await api(
@@ -2077,6 +2429,7 @@ async function tick() {
         }
       }
     }
+    await recheckSending();
     await refreshChats();
     prefetch();
   } catch (e) {
@@ -2170,9 +2523,62 @@ async function checkNet() {
   } catch (e) { /* no such permission in this browser */ }
 }
 
+// -- attachments waiting to go out with the next Send: pasted, picked or
+// dropped. Held as File objects only; nothing is written to this machine.
+let pending = [];   // [{file, url}]
+
+function addPending(files) {
+  if (!cur && !composing) return;
+  for (const f of files) {
+    pending.push({file: f, url: f.type.startsWith("image/") ? URL.createObjectURL(f) : null});
+  }
+  drawPending();
+}
+
+function clearPending() {
+  pending.forEach(p => p.url && URL.revokeObjectURL(p.url));
+  pending = [];
+  drawPending();
+}
+
+function drawPending() {
+  const tray = $("#tray");
+  tray.textContent = "";
+  pending.forEach((p, i) => {
+    const el = document.createElement("div");
+    el.className = "pend";
+    let body;
+    if (p.url) { body = document.createElement("img"); body.src = p.url; }
+    else { body = document.createElement("div"); body.className = "file"; body.textContent = p.file.name; }
+    const x = document.createElement("button");
+    x.textContent = "×";
+    x.title = "Remove";
+    x.onclick = () => { p.url && URL.revokeObjectURL(p.url); pending.splice(i, 1); drawPending(); };
+    el.append(body, x);
+    tray.append(el);
+  });
+}
+
+async function sendFiles(guid) {
+  while (pending.length) {
+    const p = pending[0];
+    // A pasted screenshot arrives as "image.png"; give it something distinct.
+    const name = p.file.name && p.file.name !== "image.png" ? p.file.name
+      : "Pasted " + new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-") + "." + ((p.file.type.split("/")[1] || "png").replace("jpeg", "jpg"));
+    await api("/api/sendfile?chat=" + encodeURIComponent(guid) + "&name=" + encodeURIComponent(name), {
+      method: "POST",
+      headers: {"Content-Type": "application/octet-stream"},
+      body: p.file,
+    });
+    p.url && URL.revokeObjectURL(p.url);
+    pending.shift();
+    drawPending();
+  }
+}
+
 async function send() {
   const text = $("#text").value;
-  if (!text.trim()) return;
+  if (!text.trim() && !pending.length) return;
   if (composing) {
     commitTerm();
     const unpicked = currentTerm();
@@ -2185,6 +2591,11 @@ async function send() {
   const handles = composing ? recips.map(r => r.handle) : [];
   if (composing && !handles.length) { $("#to").focus(); return; }
   if (!composing && !cur) return;
+  if (composing && pending.length && !text.trim()) {
+    $("#err").textContent = "Add a message to start the thread — the photo goes right after it.";
+    $("#text").focus();
+    return;
+  }
   $("#send").disabled = true;
   $("#err").textContent = "";
   try {
@@ -2196,11 +2607,15 @@ async function send() {
       });
       $("#text").value = "";
       $("#text").style.height = "auto";
+      // open() clears the tray, so the attachments go before it.
+      if (r.chat && pending.length) await sendFiles(r.chat);
+      else if (pending.length) throw new Error("the message went out, but the new thread didn't show up in time to attach the photo — open it and send the photo again");
       await refreshChats();
       if (r.chat) await open(chatFor(r.chat, recips.map(p => p.name), handles));
       else composing = false;
     } else {
-      await api("/api/send", {
+      await sendFiles(cur.guid);
+      if (text.trim()) await api("/api/send", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({chat: cur.guid, text}),
@@ -2220,6 +2635,35 @@ async function send() {
 }
 
 $("#send").onclick = send;
+$("#attach").onclick = () => $("#file").click();
+$("#file").onchange = e => { addPending(e.target.files); e.target.value = ""; $("#text").focus(); };
+$("#text").addEventListener("paste", e => {
+  const files = [...(e.clipboardData && e.clipboardData.files || [])];
+  if (!files.length) return;   // plain text pastes as usual
+  e.preventDefault();
+  addPending(files);
+});
+(() => {
+  const main = $("#main");
+  const hasFiles = e => e.dataTransfer && [...e.dataTransfer.types].includes("Files");
+  main.addEventListener("dragover", e => {
+    if (!hasFiles(e) || (!cur && !composing)) return;
+    e.preventDefault();
+    main.classList.add("drop");
+  });
+  main.addEventListener("dragleave", e => {
+    if (!main.contains(e.relatedTarget)) main.classList.remove("drop");
+  });
+  // A file dropped anywhere else would make the browser navigate to it.
+  addEventListener("dragover", e => { if (hasFiles(e)) e.preventDefault(); });
+  addEventListener("drop", e => { if (hasFiles(e)) e.preventDefault(); });
+  main.addEventListener("drop", e => {
+    main.classList.remove("drop");
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    addPending(e.dataTransfer.files);
+  });
+})();
 $("#new").onclick = startCompose;
 $("#markunread").onclick = () => { if (cur) markUnread(cur.guid); };
 // -- recipients. Picked people are chips showing their name (the handle rides
@@ -2339,6 +2783,12 @@ function pickSuggest(i) {
   if (!c) return;
   $("#to").value = "";
   hideSuggest();
+  if (c.group) {                                  // a named group: just open it
+    const g = c.group;
+    const ch = chatFor(g.guid, g.names, g.handles);
+    if (!ch.name || ch.name === g.names.join(", ")) ch.name = g.name;
+    return open(ch);
+  }
   addRecip(c.name, c.handle);
   $("#to").focus();
 }
@@ -2398,7 +2848,9 @@ $("#to").addEventListener("input", () => {
     try {
       const r = await api("/api/contacts?q=" + encodeURIComponent(term));
       if (suggestFor !== currentTerm()) return;   // typed on meanwhile
-      suggestions = r.contacts; suggestOn = suggestions.length ? 0 : -1;
+      suggestions = (r.groups || []).map(g => ({
+        name: g.name, handle: g.names.join(", "), group: g,
+      })).concat(r.contacts); suggestOn = suggestions.length ? 0 : -1;
       drawSuggest();
     } catch (e) { hideSuggest(); }
   }, 120);

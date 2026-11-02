@@ -233,6 +233,71 @@ also goes into `state.db`'s `marked` table, which makes `unread_counts()` skip
 the `is_read` filter for it; opening the thread (`/api/seen`) clears the mark. The UI deselects the thread afterwards, otherwise the open
 thread would immediately re-mark itself seen.
 
+## Delivery status
+
+An outgoing row is written with `is_sent = 0` and flipped in place once
+Messages hands it off; only a nonzero `error` means it failed. No settled row
+in chat.db sits at `is_sent = 0` without an error, so `list_messages()` reports
+that state as `sending` for `SENDING_WINDOW` (10 min) and `failed` after.
+The flip doesn't add a row, so `tick()`'s max-rowid check can't see it:
+`recheckSending()` re-reads the open thread from its oldest `sending` message
+on every poll and updates the meta line in place. Before this, a just-sent
+message showed "not delivered" until the page was reloaded.
+
+## Sending photos and files
+
+Paste an image into the message box, drop a file on the thread, or use 📎. Files
+wait in a tray above the composer (× removes one) and go out on Send, each as its
+own message, before any typed text. They're held as `File` objects in the page
+only — nothing is saved on the browser's machine.
+
+- `POST /api/sendfile?chat=<guid>&name=<filename>` with the **raw bytes** as the
+  body (no multipart parsing in the stdlib server), capped at `UPLOAD_MAX_BYTES`.
+  It's routed before `_body()`, which would try to JSON-decode the upload.
+- `sendfile.applescript` resolves `POSIX file` **outside** the `tell Messages`
+  block (inside it the term resolves against Messages' dictionary and fails),
+  then `send theFile to chat id …`. Same GUID fallback as text via
+  `send_message(…, script=SENDFILE_SCRIPT)`.
+- Files are staged in `~/Pictures/messages-proxy/<random>/<name>`, not `$TMPDIR`:
+  Messages is sandboxed and files sent from outside user folders tend to end up
+  "Not Delivered". Messages copies them into its own Attachments asynchronously,
+  so staged files are kept `UPLOAD_KEEP_SECONDS` (1 h) and pruned on the next upload.
+- Verified end to end from the cron-spawned server: a PNG to the self-chat went
+  out `is_sent=1`, `error=0`, `transfer_state=5`, and came back as an incoming
+  image. The self-chat had to be `any;-;<email>`: Messages lists no scriptable
+  chat for `any;-;<own phone number>` (-1728), even though chat.db has one.
+- Starting a **new** thread with only a photo isn't possible: the thread has to
+  exist first, so compose mode requires text, sends it via `/api/new`, then the
+  photo to the chat it returns.
+
+## Tapbacks (reactions)
+
+A tapback is a message row of its own: `associated_message_type` 2000+n adds
+reaction n (❤️ 👍 👎 😂 ‼️ ❓, n=6 is any emoji from `associated_message_emoji`)
+to the message whose guid is in `associated_message_guid` (`p:<part>/<guid>`,
+older rows `bp:<guid>`); 3000+n removes it. `reaction_of()` decodes that into
+`react: {to, emoji, add}`. The client never draws those rows. It folds them into
+`reacts` (one per person per message, so a newer one replaces theirs) and pins
+a badge to the target bubble by `data-guid`, including for reactions that
+arrive later by poll. A reaction to a message outside the loaded window is
+dropped. n=7 (a sticker placed on a bubble) carries an attachment and still
+draws as a normal row.
+
+**You can't send real tapbacks.** Messages' scripting dictionary has only
+`send`, `login`, `logout`. UI-scripting it (Accessibility grant for cron,
+steals focus) and IMCore injection (needs SIP off) were both declined.
+Clicking a bubble opens a picker (`togglePicker()`) that sends Apple's own
+fallback text through `/api/send`: `Loved “…”`, `Laughed at an image`, etc.
+That's what an iPhone sends to devices that can't show tapbacks, and Google
+Messages turns it into a real reaction. iMessage recipients get it as text.
+
+This page folds those texts back into badges: `fallbackReact()` matches the
+wording (and `Removed a heart from “…”`) against the loaded messages by exact
+quoted text (or prefix, if the quote ends in an ellipsis), or the newest
+image/attachment for `… an image`. That covers ones sent from here and ones
+from phones that can't send tapbacks. If no quoted message is loaded, it stays
+a text bubble. The match is by text, so with duplicate texts the newest wins.
+
 ## App icon / installing it
 
 The page is installable (Add to Home Screen on iOS, Install on Chrome). The icon

@@ -19,7 +19,10 @@ Linux, a Chromebook, or anything else with a browser.
   dependencies and no CDN assets.
 
 Also: contact names from Contacts and iMessage shared names, HEIC-to-JPEG image previews,
-recipient autocomplete, unread badges, and an installable home-screen app.
+recipient autocomplete, unread badges (synced with read state from Messages.app and iPhone),
+mark-as-unread (web UI only), delivery status (sending / not delivered), sending photos and
+files (paste, drop, or 📎), tapbacks shown as badges (sent as Apple's fallback text), automatic
+LAN switching when you're on the home network, and an installable home-screen app.
 
 ## Requirements
 
