@@ -219,10 +219,18 @@ and `parse_handles(…, rejects)` makes `/api/new` 400 on it.
 Before that, `parse_handles` silently dropped non-handles, so "Matt, +1415…"
 would have quietly gone out as a 1:1 to the other person.
 
+**Unread counts** are incoming messages past this app's `seen` marker **that
+are still `is_read = 0` in chat.db**. Read state syncs into chat.db from
+Messages.app and the iPhone, so a thread read anywhere clears here too. Before
+the `is_read` check, the badge only cleared when a thread was opened in this UI,
+so everything read on the phone piled up as unread on the other Mac.
+
 **Mark unread** (`POST /api/unread`) rewinds this app's `seen` marker to one below
 the chat's last incoming rowid. It is **web-UI only** — chat.db is never written, so
 Messages.app on this Mac and your iPhone keep their own read state and will not show
-the thread as unread. The UI deselects the thread afterwards, otherwise the open
+the thread as unread. Because those messages are already `is_read = 1`, the chat
+also goes into `state.db`'s `marked` table, which makes `unread_counts()` skip
+the `is_read` filter for it; opening the thread (`/api/seen`) clears the mark. The UI deselects the thread afterwards, otherwise the open
 thread would immediately re-mark itself seen.
 
 ## App icon / installing it

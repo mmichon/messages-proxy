@@ -153,6 +153,9 @@ def state_db():
     con.execute(
         "create table if not exists seen (chat_guid text primary key, rowid_seen integer not null)"
     )
+    # Chats the user marked unread here. Their messages are usually is_read=1 in
+    # chat.db already, so they're counted regardless until the thread is opened.
+    con.execute("create table if not exists marked (chat_guid text primary key)")
     con.commit()
     return con
 
@@ -528,7 +531,12 @@ def list_chats(limit=120):
     st = state_db()
     try:
         seen = dict(st.execute("select chat_guid, rowid_seen from seen").fetchall())
-        known = [(r["guid"], seen[r["guid"]]) for r in rows if r["guid"] in seen]
+        marked = {g for (g,) in st.execute("select chat_guid from marked")}
+        known = [
+            (r["guid"], seen[r["guid"]], int(r["guid"] in marked))
+            for r in rows
+            if r["guid"] in seen
+        ]
         con = chat_db()
         try:
             unread_by_guid = unread_counts(con, known)
@@ -585,19 +593,25 @@ def preview_of(row):
     return (prefix + text)[:120]
 
 
-def unread_counts(con, seen_pairs):
-    """Incoming messages newer than each chat's last-seen rowid, in one query."""
-    if not seen_pairs:
+def unread_counts(con, seen_rows):
+    """Incoming messages newer than each chat's last-seen rowid, in one query.
+
+    seen_rows are (guid, rowid_seen, marked). A message read anywhere else
+    (Messages.app here, the iPhone — read state syncs into chat.db) has
+    is_read=1 and doesn't count, unless the chat was marked unread in this UI.
+    """
+    if not seen_rows:
         return {}
-    values = ",".join(["(?,?)"] * len(seen_pairs))
-    args = [x for pair in seen_pairs for x in pair]
+    values = ",".join(["(?,?,?)"] * len(seen_rows))
+    args = [x for row in seen_rows for x in row]
     rows = con.execute(
-        "with s(guid, seen) as (values %s) "
+        "with s(guid, seen, marked) as (values %s) "
         "select c.guid, count(m.ROWID) from s "
         "join chat c on c.guid = s.guid "
         "join chat_message_join cmj on cmj.chat_id = c.ROWID "
         "join message m on m.ROWID = cmj.message_id "
         "where m.ROWID > s.seen and m.is_from_me = 0 and m.item_type = 0 "
+        "and (m.is_read = 0 or s.marked) "
         "group by c.guid" % values,
         args,
     ).fetchall()
@@ -1042,6 +1056,7 @@ def mark_unread(guid):
             "do update set rowid_seen = excluded.rowid_seen",
             (guid, last_in - 1),
         )
+        st.execute("insert or ignore into marked values (?)", (guid,))
         st.commit()
     finally:
         st.close()
@@ -1377,6 +1392,7 @@ class Handler(BaseHTTPRequestHandler):
                             "do update set rowid_seen = max(rowid_seen, excluded.rowid_seen)",
                             (guid, upto),
                         )
+                        st.execute("delete from marked where chat_guid = ?", (guid,))
                         st.commit()
                     finally:
                         st.close()
